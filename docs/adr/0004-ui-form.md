@@ -15,7 +15,7 @@ ADR-0003 定了服务与客户端的关系，这里定 GUI 这个客户端用什
 
 理由：
 
-1. **与核心同语言。** 操作与事件的类型只定义一次（`tearoom-control`），两端共用同一个 crate——不会有 JSON schema 与 Rust 类型之间的漂移。**但确实存在一条序列化边界**：ADR-0003 决定 GUI 是服务的客户端，不是核心本身，所以这一条不再是“没有 IPC”。
+1. **与核心同语言。** 操作与事件的类型只定义一次（`cherry-control`），两端共用同一个 crate——不会有 JSON schema 与 Rust 类型之间的漂移。**但确实存在一条序列化边界**：ADR-0003 决定 GUI 是服务的客户端，不是核心本身，所以这一条不再是“没有 IPC”。
 2. **没有本机攻击面。** 因果链是这样：web UI 得是浏览器能打开的东西 → 浏览器用不了 unix socket → 只能监听 loopback TCP → 于是必须处理四件事：任意本机进程能连（要 token + 只读 0600 的 runtime 文件）、任意网页能打（Host 校验挡 DNS rebinding、要求自定义 header 挡 CSRF）、以及最容易犯的"端口绑成 0.0.0.0"。native UI 没有这个约束，可以直接走 local socket，于是这四件一件都不需要。
 3. 一套 Rust 代码覆盖三平台。
 4. 体积小：不嵌 webview，不带 JS runtime。
