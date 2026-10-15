@@ -35,20 +35,24 @@ pub struct Entry {
 
 /// 列**一个**目录。`dir` 是篮子内的相对路径，空串表示篮子根（也就是 cherry 列表）。
 ///
-/// 缺口（比整棵树扫描时小多了）：`dir` 为空时每一颗 cherry 都要 `metadata`，其中任何
-/// 一颗的源文件被删掉，「根」这一层就整个挂掉。listing 是「活的索引」，一个坏条目该被
-/// 标记为缺失、而不是让整单失败。怎么选还没定。**子目录不受影响**——这是按目录列
-/// 带来的额外好处。
+/// 篮子根这一层是唯一会把「引用失效」暴露成错误的地方：每颗 cherry 都要 `metadata`。
+/// 做法是**跳过**，不是让整层失败——一条死引用不该让整个篮子打不开。而摘掉那颗 cherry
+/// 是服务的事（[`crate::service::Service::prune_dead`]，ADR-0001），这里只管列。
+///
+/// **子目录不受影响**——这是按目录列带来的额外好处。
 pub fn list_dir(basket: &Basket, dir: &str) -> Result<Vec<Entry>> {
     let mut out = Vec::new();
     if dir.is_empty() {
         // 篮子根：cherry 本身。
         for cherry in &basket.cherries {
-            // 这里不会是 `None`：`Basket::add` 已经把源路径规范化过，符号链接在那一步
-            // 就解析掉了。真出现就说明 `baskets.json` 被人手改了。
-            match entry(&cherry.name, &cherry.source)? {
-                Some(e) => out.push(e),
-                None => tracing::warn!(cherry = %cherry.name, "源不是普通文件也不是真目录，跳过"),
+            match entry(&cherry.name, &cherry.source) {
+                Ok(Some(e)) => out.push(e),
+                // 不会是 `None`：`Basket::add` 已经把源规范化过、也拦过一道。真出现就
+                // 说明 `baskets.json` 被人手改了。
+                Ok(None) => tracing::warn!(cherry = %cherry.name, "不是普通文件也不是真目录，跳过"),
+                // 源没了。服务发现之后会把这颗摘掉（ADR-0001）；这里是刚删掉、还没来得及
+                // 摘的那一瞬。跳过就行——一条死引用不该把整层拖垮。
+                Err(e) => tracing::warn!(cherry = %cherry.name, "源的元数据读不到，跳过: {e:#}"),
             }
         }
     } else {
@@ -67,9 +71,11 @@ pub fn list_dir(basket: &Basket, dir: &str) -> Result<Vec<Entry>> {
                     continue;
                 }
             };
-            match entry(&name, &de.path())? {
-                Some(e) => out.push(e),
-                None => tracing::warn!(path = %de.path().display(), "符号链接之类，不共享"),
+            match entry(&name, &de.path()) {
+                Ok(Some(e)) => out.push(e),
+                Ok(None) => tracing::warn!(path = %de.path().display(), "符号链接之类，不共享"),
+                // 列目录和读元数据之间文件被删了。跳过它，别让一个竞态把整层弄失败。
+                Err(e) => tracing::warn!(path = %de.path().display(), "读不到元数据，跳过: {e:#}"),
             }
         }
     }
@@ -276,6 +282,21 @@ mod tests {
             "跟随链接的话就看不出它是链接了"
         );
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 源没了：跳过它就行，别让一条死引用把整个篮子根变成错误。摘掉那颗是服务的事。
+    #[test]
+    fn 根这一层跳过源没了的() {
+        let (mut b, dir) = tree("deadroot");
+        let dead = dir.join("dead.txt");
+        std::fs::write(&dead, b"x").unwrap();
+        b.add(&dead).unwrap();
+        assert_eq!(list_dir(&b, "").unwrap().len(), 2);
+
+        std::fs::remove_file(&dead).unwrap();
+        let top = list_dir(&b, "").unwrap();
+        assert_eq!(top.len(), 1, "死引用该被跳过，不是让整层失败");
+        assert_eq!(top[0].name, b.cherries[0].name);
     }
 
     /// 符号链接不共享，也不许从它中间穿过：指到外面等于绕开 `..` 的封锁，指到里面

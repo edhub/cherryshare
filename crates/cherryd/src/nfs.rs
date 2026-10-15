@@ -370,6 +370,12 @@ impl NFSFileSystem for BasketNfs {
         max_entries: usize,
     ) -> Result<ReadDirResult, nfsstat3> {
         let (basket, sub) = self.target(dirid).await?;
+        // 列篮子根的时候顺手看一眼引用还指得着不，发现失效就摘掉（ADR-0001）。只做这一层：
+        // 子目录列目录是热路径，不该顺带 stat 每一颗 cherry。摘掉之后手里这份是旧的，
+        // `list_dir` 会把那颗跳过，列出来的结果一样。
+        if sub.is_empty() {
+            self.svc.prune_dead(&basket.id).await;
+        }
         let entries = Self::listing(&basket, &sub).await?;
 
         // 分页的 cookie 就是 fileid，所以子项必须按 fileid 有序。每次现排：目录不大，

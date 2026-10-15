@@ -63,11 +63,10 @@ impl Basket {
             .with_context(|| format!("找不到 {}", source.display()))?;
         let meta = std::fs::symlink_metadata(&source)
             .with_context(|| format!("读不到 {}", source.display()))?;
-        let kind = if meta.is_dir() {
-            CherryKind::Dir
-        } else {
-            CherryKind::File
-        };
+        // 「只有真文件和真目录能对外」只有一处判断（`listing::servable`），进篮子的时候
+        // 也得问它：不然会放进来一个 listing 永远不列、也永远挂不出来的东西。
+        let kind = crate::listing::servable(&meta)
+            .with_context(|| format!("{} 不是普通文件也不是真目录，不共享", source.display()))?;
 
         let name = source
             .file_name()
@@ -123,6 +122,15 @@ mod tests {
         // 同一个源再加一次会被名字挡住。
         let err = b.add(&f).unwrap_err().to_string();
         assert!(err.contains("已经有一颗"), "{err}");
+    }
+
+    /// 「只有真文件和真目录能对外」这条规则在进篮子的时候就该生效：放进来一个 listing
+    /// 永远不列的东西，等于静默地分享了一个不存在的东西。
+    #[test]
+    fn 拒绝字符设备之类() {
+        let mut b = Basket::new("test").unwrap();
+        let err = b.add(Path::new("/dev/null")).unwrap_err().to_string();
+        assert!(err.contains("不共享"), "{err}");
     }
 
     #[test]

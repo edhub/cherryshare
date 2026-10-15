@@ -52,7 +52,11 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
 }
 
 fn main() -> Result<()> {
+    use std::io::IsTerminal;
+    // 服务常驻的时候 stderr 是个文件（launchd 写 ~/Library/Logs/cherryd.log）。
+    // 日志是「源没了」这类事件唯一的记录，不能往里灌转义码，不然 grep 出来没法看。
     tracing_subscriber::fmt()
+        .with_ansi(std::io::stderr().is_terminal())
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("CHERRY_LOG")
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
