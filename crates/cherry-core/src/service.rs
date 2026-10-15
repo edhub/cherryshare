@@ -7,7 +7,6 @@
 //! basket 讲成只读 NFS（见 `cherryd` 的 `nfs`），对方的**内核**直接读这台机器的磁盘。
 
 use std::{
-    net::IpAddr,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -18,7 +17,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use tokio::sync::RwLock;
 
-use crate::{basket::Basket, link::BasketLink};
+use crate::{
+    basket::Basket,
+    link::{BasketLink, Host},
+};
 
 #[derive(Clone)]
 pub struct Service {
@@ -173,11 +175,16 @@ impl Service {
     /// 本机这个 basket 的链接。`host` 不给就自己挑一个（见 [`crate::link::lan_addrs`]）。
     ///
     /// "填哪个地址"只有这里判一次，不让每个客户端各自判一遍（ADR-0003）。
-    pub async fn link(&self, basket: &str, host: Option<IpAddr>) -> Result<BasketLink> {
+    pub async fn link(&self, basket: &str, host: Option<Host>) -> Result<BasketLink> {
         let b = self.basket(basket).await?;
+        // 默认用本机名：链接是给同一个局域网里的人用的，而名字比 IP 稳——那边换了
+        // DHCP 地址，链接还成立（ADR-0002）。名字是组播解析，过不了路由和隧道，
+        // 走别处的对方要用 IP，那就显式给。
+        // 拿不到本机名（少见）就只能回退到 IP。
         let host = match host {
             Some(h) => h,
-            None => crate::link::lan_addrs()?.preferred,
+            None => crate::link::local_hostname()
+                .unwrap_or(Host::Ip(crate::link::lan_addrs()?.preferred)),
         };
         Ok(BasketLink::new(host, b.id))
     }

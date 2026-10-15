@@ -9,7 +9,6 @@
 //! socket 权限 0600，内核强制只有同用户能连，所以不需要 token；客户端这一侧没有端口，
 //! 也就没有网络攻击面。
 
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -18,6 +17,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
 use cherry_core::Service;
+use cherry_core::link::Host;
 
 const SOCKET_FILE: &str = "cherryd.sock";
 
@@ -197,8 +197,8 @@ async fn dispatch_inner(svc: &Service, req: &Request) -> Result<Response> {
             Ok(Response::Basket(view(&svc.basket(basket).await?)))
         }
         Request::Link { basket, host } => {
-            let host: Option<IpAddr> = match host {
-                Some(h) => Some(h.parse().with_context(|| format!("`{h}` 不是合法地址"))?),
+            let host = match host.as_deref() {
+                Some(h) => Some(Host::parse(h)?),
                 None => None,
             };
             Ok(Response::Link(svc.link(basket, host).await?.to_string()))

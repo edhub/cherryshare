@@ -19,10 +19,92 @@ pub const NFS_PORT: u16 = 20490;
 /// 粘进聊天窗口，也可能被人看一眼。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BasketLink {
-    /// 创建者在局域网上的地址。
-    pub host: IpAddr,
+    /// 对方怎么找到创建者。见 [`Host`]。
+    pub host: Host,
     /// 凭证，不是索引：谁拿到谁就能看。吊销 = 换一个新的 `basket_id`。
     pub basket_id: [u8; 16],
+}
+
+/// 链接和挂载命令里那一段地址：一个 IP，或者对方能解析的一个名字。
+///
+/// 名字这一路是给**同一个广播域**的对方用的。`.local` 是 mDNS，组播，过不了路由器，
+/// 也过不了隧道（实测：你机器上那串全隧道把 10.1.55.11、10.1.0.22 都兜走了，只有
+/// 同网段的对方能用名字）。换来的是换 DHCP 地址之后链接还成立。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Host {
+    Ip(IpAddr),
+    /// 已经校验过字符集的名字，见 [`Host::parse`]。
+    Name(String),
+}
+
+impl Host {
+    /// 能当 IP 就当 IP，否则按名字校验。
+    ///
+    /// IP 先判：IPv6 里带冒号，字符集那一关它过不去。
+    pub fn parse(s: &str) -> Result<Self> {
+        // 链接里抠出来的 IPv6 是带方括号的，命令行上手打也可能带上。
+        let bare = s
+            .strip_prefix('[')
+            .and_then(|r| r.strip_suffix(']'))
+            .unwrap_or(s);
+        if let Ok(ip) = bare.parse::<IpAddr>() {
+            return Ok(Self::Ip(ip));
+        }
+
+        if s.is_empty() || s.len() > 253 {
+            bail!("`{s}` 当主机名太短或太长");
+        }
+        // 这串东西会被原样拼进 `cherry link` 打出来的那行挂载命令里，人要拷进 shell 粘。
+        // 所以字符集卡死：不给引号、分号、空白、斜杠留位置。冒号也不行——链接是按
+        // 冒号切的。
+        if !s
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        {
+            bail!("`{s}` 里有当不了主机名的字符（只给字母数字和 `-` `_` `.` 留位置）");
+        }
+        if s.starts_with('-') {
+            bail!("`{s}` 以 `-` 开头，会被挂载命令当成选项");
+        }
+        Ok(Self::Name(s.to_owned()))
+    }
+}
+
+impl fmt::Display for Host {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            // IPv6 要套方括号，不然那个冒号会被当成分隔符。
+            Self::Ip(IpAddr::V6(a)) => write!(f, "[{a}]"),
+            Self::Ip(IpAddr::V4(a)) => write!(f, "{a}"),
+            Self::Name(n) => write!(f, "{n}"),
+        }
+    }
+}
+
+/// 本机的 mDNS 名（`mbpmax.local` 这种），当候选印出来用。
+///
+/// 拿的是 `gethostname(2)`。macOS 上它给的就是 Bonjour 名；Linux 上得看 avahi 怎么配。
+/// **所以它只当候选，不当默认**——猜错了对方就挂不上，而对方挂不上的时候我们这边
+/// 什么也看不见。
+pub fn local_hostname() -> Option<Host> {
+    let mut buf = [0u8; 256];
+    // SAFETY: 传的是我们自己这块缓冲区的指针和长度，`gethostname` 只会往里写。
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0)?;
+    let name = std::str::from_utf8(&buf[..end]).ok()?;
+    if name.is_empty() {
+        return None;
+    }
+    // mDNS 的名字必须带 `.local`。有些系统给的就是全名，有些只给主机名。
+    let name = if name.contains('.') {
+        name.to_owned()
+    } else {
+        format!("{name}.local")
+    };
+    Host::parse(&name).ok()
 }
 
 /// 对方那边是什么系统。
@@ -37,7 +119,7 @@ pub enum MountOs {
 }
 
 impl BasketLink {
-    pub fn new(host: IpAddr, basket_id: [u8; 16]) -> Self {
+    pub fn new(host: Host, basket_id: [u8; 16]) -> Self {
         Self { host, basket_id }
     }
 
@@ -51,12 +133,9 @@ impl BasketLink {
         hex::decode(s).ok()?.try_into().ok()
     }
 
-    /// 挂载命令里的 `server:/path`。方括号套 IPv6。
+    /// 挂载命令里的 `server:/path`。
     pub fn mount_source(&self) -> String {
-        match self.host {
-            IpAddr::V6(a) => format!("[{a}]:/{}", self.basket_id_hex()),
-            IpAddr::V4(a) => format!("{a}:/{}", self.basket_id_hex()),
-        }
+        format!("{}:/{}", self.host, self.basket_id_hex())
     }
 
     /// 对方要粘的那一行命令（`mkdir` 和挂载串在一起，粘一次就行）。
@@ -192,10 +271,7 @@ fn route_source_addr() -> Option<IpAddr> {
 
 impl fmt::Display for BasketLink {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.host {
-            IpAddr::V6(a) => write!(f, "cherryshare:[{a}]:{}", self.basket_id_hex()),
-            IpAddr::V4(a) => write!(f, "cherryshare:{a}:{}", self.basket_id_hex()),
-        }
+        write!(f, "cherryshare:{}:{}", self.host, self.basket_id_hex())
     }
 }
 
@@ -211,10 +287,7 @@ impl FromStr for BasketLink {
         let (host, id_hex) = rest
             .rsplit_once(':')
             .context("链接里没有地址和 id 的分隔")?;
-        let host = host.trim_start_matches('[').trim_end_matches(']');
-        let host: IpAddr = host
-            .parse()
-            .with_context(|| format!("`{host}` 不是合法地址"))?;
+        let host = Host::parse(host).context("链接里那段地址用不了")?;
         let basket_id =
             Self::parse_basket_id_hex(id_hex).context("链接里的 basket id 不是 32 位十六进制")?;
         Ok(Self { host, basket_id })
@@ -226,7 +299,7 @@ mod tests {
     use super::*;
 
     fn sample() -> BasketLink {
-        BasketLink::new("192.168.8.195".parse().unwrap(), [7u8; 16])
+        BasketLink::new(Host::parse("192.168.8.195").unwrap(), [7u8; 16])
     }
 
     #[test]
@@ -239,7 +312,7 @@ mod tests {
 
     #[test]
     fn ipv6_要套方括号且能解析回来() {
-        let link = BasketLink::new("fd00::1".parse().unwrap(), [1u8; 16]);
+        let link = BasketLink::new(Host::parse("fd00::1").unwrap(), [1u8; 16]);
         let s = link.to_string();
         assert!(s.contains("[fd00::1]"), "{s}");
         assert_eq!(s.parse::<BasketLink>().unwrap(), link);
@@ -252,10 +325,49 @@ mod tests {
             "cherryshare:1.2.3.4".parse::<BasketLink>().is_err(),
             "缺 id"
         );
-        let e = "cherryshare:nope:07".parse::<BasketLink>().unwrap_err();
-        assert!(e.to_string().contains("合法地址"), "{e}");
+        // 名字是允许的，所以坏的是那串字符本身。
+        let e = "cherryshare:a b:07".parse::<BasketLink>().unwrap_err();
+        assert!(format!("{e:#}").contains("主机名"), "{e:#}");
         let e = "cherryshare:1.2.3.4:zz".parse::<BasketLink>().unwrap_err();
         assert!(e.to_string().contains("32 位十六进制"), "{e}");
+    }
+
+    #[test]
+    fn 名字也能进链接() {
+        let link = BasketLink::new(Host::parse("mbpmax.local").unwrap(), [3u8; 16]);
+        let s = link.to_string();
+        assert_eq!(s, format!("cherryshare:mbpmax.local:{}", "03".repeat(16)));
+        assert_eq!(s.parse::<BasketLink>().unwrap(), link);
+        for os in [MountOs::Macos, MountOs::Linux] {
+            let cmd = link.mount_command(os, "~/cherry/x");
+            assert!(cmd.contains("mbpmax.local:/"), "{cmd}");
+        }
+    }
+
+    /// 这串字符会被原样拼进那行要粘进 shell 的命令里，所以只能放这几种。
+    #[test]
+    fn 名字里的坏字符要拒() {
+        for bad in [
+            "a;rm -rf ~",
+            "a b",
+            "a/b",
+            "-x",
+            "$(id)",
+            "a\nb",
+            "a:20490",
+            "",
+        ] {
+            assert!(Host::parse(bad).is_err(), "该拒：{bad:?}");
+        }
+        for ok in [
+            "mbpmax.local",
+            "nas",
+            "my-box_2.local",
+            "10.1.2.52",
+            "fd00::1",
+        ] {
+            assert!(Host::parse(ok).is_ok(), "该收：{ok}");
+        }
     }
 
     #[test]

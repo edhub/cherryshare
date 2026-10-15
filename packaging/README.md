@@ -49,8 +49,13 @@ Ctrl-C 停）。然后：
     cherry new 我的照片                    # 建一个篮子
     cherry add 我的照片 ~/Pictures/2026     # 往里放东西（只是引用，文件不动）
     cherry link 我的照片                    # 打出链接 + 对方要粘的命令
+    cherry link 我的照片 --host 10.1.2.52     # 链接里用 IP（对方不跟你同一个局域网时）
 
-把 `cherry link` 打出来的整段发给对方就行。别的：
+把 `cherry link` 打出来的整段发给对方就行。链接里默认是你的本机名（`mbpmax.local`
+这种），同一个局域网里的对方能用，而且你换了 DHCP 地址链接还成立。对方要是走路由或
+隧道过来的（VPN、别的网段），名字过不去，得换成 IP——`cherry link` 会把候选地址印出来。
+
+别的：
 
     cherry list                  本机有哪些篮子
     cherry show 我的照片          篮子里有什么

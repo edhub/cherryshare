@@ -57,7 +57,8 @@ enum Cmd {
     Link {
         /// 篮子名
         basket: String,
-        /// 链接里填哪个地址。不给就问内核要（多网卡 / 有 VPN 时可能要显式给）
+        /// 链接里填哪个地址。不给我就用本机名（`mbpmax.local` 这种，只在同一个局域网
+        /// 里解析得了）；对方走路由或隧道时显式给一个 IP
         #[arg(long)]
         host: Option<String>,
     },
@@ -66,7 +67,6 @@ enum Cmd {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-
     let data_dir = match cli.data_dir {
         Some(d) => d,
         None => cherry_core::service::default_data_dir()?,
@@ -170,15 +170,17 @@ fn print(resp: Response) {
                     println!("    卸掉：{}", BasketLink::unmount_command(os, &mnt));
                 }
 
-                // 自动挑的那个未必是对方能到的（有 VPN、有虚拟机网桥的时候），
-                // 所以把其余候选也印出来。
-                if let Ok(addrs) = cherry_core::link::lan_addrs()
-                    && !addrs.others.is_empty()
-                {
-                    let list: Vec<String> = addrs.others.iter().map(|a| a.to_string()).collect();
+                // 链接默认是本机名，而名字只在同一个广播域里解析得了（mDNS 是组播，
+                // 过不了路由，也过不了隧道）。所以把地址候选印出来：对方走别处就换 IP。
+                if let Ok(addrs) = cherry_core::link::lan_addrs() {
+                    let mut list: Vec<String> = vec![addrs.preferred.to_string()];
+                    list.extend(addrs.others.iter().map(|a| a.to_string()));
                     println!(
-                        "  （挑的是 {}。对方挂不上就换这几个试：{}）",
-                        link.host,
+                        "  对方走路由或隧道就换成 IP（挑的是 {}）：",
+                        addrs.preferred
+                    );
+                    println!(
+                        "    cherry link <篮子名> --host <其中一个>   {}",
                         list.join("  ")
                     );
                 }

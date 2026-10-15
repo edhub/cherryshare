@@ -94,6 +94,7 @@ impl Basket {
 }
 
 /// 名字会变成 listing 里的路径段，所以不能含分隔符、不能是 `.` / `..`。
+/// 名字：不能带路径分隔符。
 fn validate_name(name: &str) -> Result<()> {
     if name.is_empty() {
         bail!("名字不能为空");
@@ -148,6 +149,7 @@ mod tests {
         assert!(Basket::new("").is_err());
     }
 
+    /// cherry 名来自磁盘上的文件名——`my file.txt` 这种必须能进篮子，而它只出现在
     #[test]
     fn id_是随机的() {
         let a = Basket::new("x").unwrap();
