@@ -71,6 +71,8 @@ enum Cmd {
     },
 }
 
+// 这个 CLI 是个瘦客户端：真正的传输在 cherryd 里，这里只发请求、读进度。
+// 所以不需要 cherryd 那个压 worker 数的处理（见 crates/cherryd 的 runtime()）。
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();

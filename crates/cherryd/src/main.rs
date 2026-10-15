@@ -4,6 +4,8 @@
 //! （redb 排他锁，OS 强制）、basket 配置与索引缓存（设计选择）。见 ADR-0003。
 //!
 //! 只有一种起法：由系统拉起（macOS LaunchAgent / unix systemd），或者前台跑。
+//!
+//! **tokio worker 数是刻意压低的一个显式选择**，理由见 [`runtime`]。
 
 use std::path::PathBuf;
 
@@ -20,15 +22,52 @@ struct Args {
     data_dir: Option<PathBuf>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// cherryd 的 tokio worker 数。默认 **1**，不是 `num_cpus`。
+///
+/// 实测（macOS loopback，200 MiB，两端合计 CPU）——单位 ns/字节：
+///
+/// ```text
+/// workers      1 个下载   2 个并发   4 个并发
+/// 1              27.5      26.8       26.8
+/// 2              35.3      49.4       49.9
+/// ~10（默认）     42.3      71.2      105.7
+/// ```
+///
+/// **worker 越多越差，而且成本随并发退化。** 这个负载是几条热的单线程状态机
+/// （endpoint driver、每条连接的 driver、blob 传输），摊到多个核上只会付
+/// 任务迁移 + 跳核唤醒 + 工作窃取；少两个 worker 反而让它们在同一核上跑，缓存是热的。
+///
+/// **顺带纠正一个直觉：1 个 worker 不会串行化。** 并发上去吞吐反而涨
+/// （57.3 → 65.0 → 68.0 MB/s），而每字节成本完全平坦（~27 ns）。
+///
+/// **代价与前提。** 1 个 worker 意味着任何一个阻塞调用都会卡住整个守护进程。
+/// 已知的阻塞点已经处理：`listing::scan`（同步目录遍历）丢进了 `spawn_blocking`；
+/// iroh-blobs 的 store 有自己的线程（`iroh-blob-store-0`）做文件 I/O。
+/// **没审计过的是 iroh/noq 内部**——如果哪天出现“守护进程整体卡住”的怪象，
+/// 先试 `CHERRY_WORKERS=4` 排除这一条。
+fn runtime() -> Result<tokio::runtime::Runtime> {
+    let workers = std::env::var("CHERRY_WORKERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()
+        .context("建 tokio 运行时")
+}
+
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("CHERRY_LOG")
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+    runtime()?.block_on(run())
+}
 
+async fn run() -> Result<()> {
     let args = Args::parse();
     let data_dir = match args.data_dir {
         Some(d) => d,

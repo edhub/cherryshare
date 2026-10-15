@@ -42,9 +42,12 @@ impl Provider {
         match req {
             WireRequest::GetListing { basket_id } => {
                 let basket = self.svc.basket_by_id(&basket_id).await?;
-                Ok(WireResponse::Listing {
-                    entries: listing::scan(&basket)?,
-                })
+                // 同步目录遍历丢进 blocking 线程：大目录可能走很久，而 cherryd 的 tokio
+                // worker 数刻意压得很低（见 cherryd 的 runtime()），不能让它把运行时卡住。
+                let entries = tokio::task::spawn_blocking(move || listing::scan(&basket))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("listing 任务没能跑完: {e}"))??;
+                Ok(WireResponse::Listing { entries })
             }
             WireRequest::GetFile { basket_id, path } => {
                 let basket = self.svc.basket_by_id(&basket_id).await?;
