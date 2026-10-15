@@ -63,6 +63,19 @@ enum Cmd {
         /// 篮子内的相对路径。不给就是篮子根。
         path: Option<String>,
     },
+    /// 读对方一个文件的一段字节（默认从开头读 64 KiB）
+    Cat {
+        /// BasketLink
+        link: String,
+        /// 篮子内的相对路径
+        path: String,
+        /// 从哪个字节开始
+        #[arg(long, default_value_t = 0)]
+        start: u64,
+        /// 读多少字节
+        #[arg(long, default_value_t = 64 * 1024)]
+        len: u64,
+    },
     /// 从别人的篮子里挑一个文件下来
     Pick {
         /// BasketLink
@@ -115,6 +128,17 @@ fn to_request(cmd: Cmd) -> Request {
         Cmd::Ls { link, path } => Request::Ls {
             link,
             dir: path.unwrap_or_default(),
+        },
+        Cmd::Cat {
+            link,
+            path,
+            start,
+            len,
+        } => Request::Cat {
+            link,
+            path,
+            start,
+            len,
         },
         Cmd::Pick { link, path, dest } => Request::Fetch { link, path, dest },
     }
@@ -176,6 +200,12 @@ fn print(resp: Response) {
                 human_size(f.bytes),
                 f.path.display()
             );
+        }
+        Response::Bytes(bytes) => {
+            use std::io::Write;
+            // 管道断掉（`| head`）是正常的，不当错误。
+            let _ = std::io::stdout().write_all(&bytes);
+            let _ = std::io::stdout().flush();
         }
     }
 }

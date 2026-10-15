@@ -275,6 +275,23 @@ iperf3 -s -1 & iperf3 -c 127.0.0.1 -u -l 1452 -b 0 -t 5      # → 3.97 µs/包
 所以 cherry 在真实链路上只用 **0.3~0.5 核**，是**链路受限**而不是 CPU 受限。
 这 6 倍只在「≥500 Mbit/s 的链路」上才有意义——而那正是 ADR-0005 写的触发条件。
 
+### 6. `BlobReader` 读 store 慢 100 倍 —— 用 `export_ranges`
+
+`store.blobs().reader(hash)` 看着最自然（实现了 `AsyncRead` + `AsyncSeek`），实测却大约
+**2 MB/s**：1 KiB 一次 store RPC，而且每次都从头走一遍 bao 树。
+
+换成 `export_ranges(hash, offset..end).concatenate()`（一次遍历）后：
+
+| 读长度 | `BlobReader` | `export_ranges` |
+|---|---|---|
+| 256 KiB | 90 ms | — |
+| 1 MiB | 370 ms | **20 ms** |
+| 4 MiB | 1940 ms | **30 ms** |
+| 8 MiB | — | **40 ms**（≈200 MB/s）|
+
+这也解释了之前那句「loopback 导出 547 MB/s」——快的是导出路径，不是 reader。
+ADR-0003 担心的「文件系统的读是小块、同步的……会慢到不可用」，指的就是这一层。
+
 ## 更正过的错误结论
 
 | 说过的 | 实际 |

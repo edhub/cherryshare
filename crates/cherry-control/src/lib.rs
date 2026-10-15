@@ -44,11 +44,20 @@ pub enum Request {
     Link {
         basket: String,
     },
-    /// 列对方篮子的一个目录。
+    /// 列对方篮子里**一个目录**。空串表示篮子根（ADR-0006：listing 的单位是一个目录）
     Ls {
         link: String,
         /// 篮子内的相对路径，空串表示篮子根。
         dir: String,
+    },
+    /// 读对方某一个文件的一段字节（ADR-0006 的 `Read`）。
+    Cat {
+        link: String,
+        path: String,
+        /// 从哪开始。
+        start: u64,
+        /// 读多少。
+        len: u64,
     },
     /// 从别人的篮子里取一个文件。
     Fetch {
@@ -76,6 +85,8 @@ pub enum Response {
     Basket(BasketView),
     Link(String),
     Listing(Vec<Entry>),
+    /// 一段原始字节。帧上限 16 MiB（见 `proto::MAX_FRAME`）。
+    Bytes(Vec<u8>),
     Fetched(Fetched),
     Error(String),
 }
@@ -226,6 +237,23 @@ async fn dispatch_inner(
         Request::Ls { link, dir } => {
             let link: cherry_core::BasketLink = link.parse().context("链接解析失败")?;
             Ok(Response::Listing(svc.list_dir(&link, dir).await?))
+        }
+        Request::Cat {
+            link,
+            path,
+            start,
+            len,
+        } => {
+            let link: cherry_core::BasketLink = link.parse().context("链接解析失败")?;
+            // 回应是一帧，而帧上限是 16 MiB。这是**我们的**协议限制，所以在 core/control
+            // 这一层判，不让客户端各自去判（ADR-0003）。
+            const CAP: u64 = 8 * 1024 * 1024;
+            anyhow::ensure!(*len <= CAP, "一次最多读 {CAP} 字节（IPC 帧上限 16 MiB）");
+            // 先 Open（路径 → hash），再按范围读。
+            let (hash, size) = svc.open_file(&link, path).await?;
+            Ok(Response::Bytes(
+                svc.read_range(&link, hash, size, *start, *len).await?,
+            ))
         }
         Request::Fetch { link, path, dest } => {
             let link: cherry_core::BasketLink = link.parse().context("链接解析失败")?;

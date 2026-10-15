@@ -12,6 +12,7 @@ use iroh::{Endpoint, protocol::Router};
 use iroh_blobs::{
     BlobsProtocol, Hash,
     api::{Store, remote::GetProgressItem},
+    protocol::{ChunkRanges, ChunkRangesExt, GetRequest},
     store::fs::FsStore,
 };
 use futures_lite::StreamExt;
@@ -26,6 +27,12 @@ use crate::{
     proto::{ALPN, WireRequest, WireResponse, read_frame, write_frame},
     provider::Provider,
 };
+
+/// 取数单位（ADR-0006 决策五）。
+///
+/// 校验粒度是 BLAKE3 chunk = 1KB（协议定死），但**一次要多少**是我们的策略：一条 1KB 的
+/// range 请求等于一次网络往返。1MB 的依据是 LAN 上 RTT ~1ms，1MB 大约十到几十毫秒取完。
+const BLOCK: u64 = 1024 * 1024;
 
 /// 进度通知。客户端把它变成自己要显示的东西；core 不认识「UI」。
 #[derive(Debug, Clone)]
@@ -251,24 +258,7 @@ impl Service {
     ) -> Result<Fetched> {
         notice(Notice::Info(format!("问创建者要 `{path}` 的 hash…")));
 
-        let conn = self.connect(link).await?;
-        let (mut send, mut recv) = conn.open_bi().await.context("开流失败")?;
-        write_frame(
-            &mut send,
-            &WireRequest::GetFile {
-                basket_id: link.basket_id,
-                path: path.to_owned(),
-            },
-        )
-        .await?;
-        send.finish().context("关流失败")?;
-
-        let (hash, size) = match read_frame::<_, WireResponse>(&mut recv).await? {
-            Some(WireResponse::File { hash, size }) => (hash, size),
-            Some(WireResponse::Error { message }) => bail!("创建者那边：{message}"),
-            Some(other) => bail!("意外的响应：{other:?}"),
-            None => bail!("创建者没回话就断了"),
-        };
+        let (hash, size) = self.open_file(link, path).await?;
         notice(Notice::Info(format!(
             "创建者准备好了（{size} 字节），开始取字节…"
         )));
@@ -349,6 +339,133 @@ impl Service {
             .connect(link.addr.clone(), ALPN)
             .await
             .with_context(|| format!("连不上创建者 {}", link.addr.id))
+    }
+
+    /// 把一个篮子内的路径换成 `(hash, size)`。ADR-0006 管这叫 `Open`。
+    ///
+    /// 昂贵的那一半在创建者那边，但现在有索引缓存接着（见 [`Self::hash_file`]）。
+    ///
+    /// **每次调用都新建一条 QUIC 连接**，而实测一次 `cat` 的固定开销是 ~10~20 ms
+    /// （其中 ~8 ms 是本地 socket 的往返）。CLI 一次一个请求无所谓，**但 mount 会被它
+    /// 卡死**——128 KiB 的读配 20 ms 的固定开销就是 ~10 MB/s。做 mount 时要把连接
+    /// 留下来复用，或者把 range 读做成一条长流。见 docs/mount.md。
+    pub async fn open_file(&self, link: &BasketLink, path: &str) -> Result<(Hash, u64)> {
+        let conn = self.connect(link).await?;
+        let (mut send, mut recv) = conn.open_bi().await.context("开流失败")?;
+        write_frame(
+            &mut send,
+            &WireRequest::GetFile {
+                basket_id: link.basket_id,
+                path: path.to_owned(),
+            },
+        )
+        .await?;
+        send.finish().context("关流失败")?;
+
+        match read_frame::<_, WireResponse>(&mut recv).await? {
+            Some(WireResponse::File { hash, size }) => Ok((hash, size)),
+            Some(WireResponse::Error { message }) => bail!("创建者那边：{message}"),
+            Some(other) => bail!("意外的响应：{other:?}"),
+            None => bail!("创建者没回话就断了"),
+        }
+    }
+
+    // ---- 按范围读：mount 的数据路径（ADR-0006）----
+
+    /// 让 store 拥有 `[start, end)` 这段字节，**缺哪块取哪块**。
+    ///
+    /// 这个填充循环不用我们自己写：`local_for_request` 问出「这段里已经有哪些」，
+    /// `missing()` 给出「还缺什么」（顺带就是断点续传），`execute_get` 把缺的取回来。
+    async fn ensure_range(
+        &self,
+        link: &BasketLink,
+        hash: Hash,
+        start: u64,
+        end: u64,
+    ) -> Result<()> {
+        let req = GetRequest::builder()
+            .root(ChunkRanges::bytes(start..end))
+            .build(hash);
+        let local = self
+            .inner
+            .store
+            .remote()
+            .local_for_request(req)
+            .await
+            .with_context(|| format!("问 store 要 {hash} 的 [{start},{end}) 失败"))?;
+        if local.is_complete() {
+            return Ok(());
+        }
+
+        let conn = self
+            .inner
+            .endpoint
+            .connect(link.addr.clone(), iroh_blobs::ALPN)
+            .await
+            .with_context(|| format!("连不上创建者的 blobs 服务 {}", link.addr.id))?;
+        let mut stream = self
+            .inner
+            .store
+            .remote()
+            .execute_get(conn, local.missing())
+            .stream();
+        while let Some(item) = stream.next().await {
+            match item {
+                GetProgressItem::Progress(_) => {}
+                GetProgressItem::Done(_) => return Ok(()),
+                GetProgressItem::Error(e) => {
+                    bail!("取 {hash} 的 [{start},{end}) 失败: {e}")
+                }
+            }
+        }
+        bail!("取 {hash} 的 [{start},{end}) 中途断了")
+    }
+
+    /// 读一段字节。未命中就先填，填的时候**顺手多取一块**（ADR-0006 决策五的预读）。
+    ///
+    /// **未实现：自适应预读窗口。** ADR-0006 决策五说的是「连续命中后窗口翻倍」，
+    /// 现在是一个固定的 +1 块。后果是小块读会超取——一个 128 KiB 的 mount 读会
+    /// 取回 2 MiB（对齐的 1 MiB 加预读的 1 MiB）。局域网里不贵，但等真正做 mount
+    /// 时该按顺序访问检测把它调小（或把 [`BLOCK`] 调小）。见 docs/mount.md。
+    ///
+    /// 取数单位是 [`BLOCK`]，不是 1KB：一条 1KB 的 range 请求等于一次网络往返。
+    ///
+    /// **从 store 读不用 `BlobReader`。** 那个 API 看上去最自然（`AsyncRead` + `AsyncSeek`），
+    /// 实测却大约 **2 MB/s**（1 KiB 一次 store RPC，而且每次都从头走一遍 bao 树）。
+    /// 换成 `export_ranges(..).concatenate()` 就是一次遍历：4 MiB 从 1.9 秒降到毫秒级
+    /// （这也是 docs/performance.md 里那个「导出 547 MB/s」）。
+    pub async fn read_range(
+        &self,
+        link: &BasketLink,
+        hash: Hash,
+        size: u64,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let end = offset.saturating_add(len);
+        if end > size {
+            bail!("要 {offset}..{end}，但这个文件只有 {size} 字节");
+        }
+
+        // 对齐到块边界，再往外多要一块。多要的那块下次读就在缓存里了。
+        let start = offset / BLOCK * BLOCK;
+        let fetch_end = end
+            .div_ceil(BLOCK)
+            .saturating_add(1)
+            .saturating_mul(BLOCK)
+            .min(size.max(BLOCK));
+        self.ensure_range(link, hash, start, fetch_end).await?;
+
+        self.inner
+            .store
+            .blobs()
+            .export_ranges(hash, offset..end)
+            .concatenate()
+            .await
+            .with_context(|| format!("从 store 读 {hash} 的 {offset}..{end} 失败"))
     }
 
     /// 把一个文件算成 hash 并放进 store，这样查看者能按 hash 取走它。
