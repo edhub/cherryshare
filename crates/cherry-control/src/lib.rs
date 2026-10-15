@@ -46,9 +46,9 @@ pub enum Request {
         basket: String,
         name: String,
     },
-    /// 打出本机某个 basket 的分享链接。`host` 不给就问内核要（见 ADR-0002）。
+    /// 打出分享链接。`basket` 不给就是每个篮子一条，`host` 不给就用本机名（ADR-0002）。
     Link {
-        basket: String,
+        basket: Option<String>,
         host: Option<String>,
     },
 }
@@ -64,7 +64,7 @@ pub enum Response {
     },
     Baskets(Vec<BasketView>),
     Basket(BasketView),
-    Link(String),
+    Links(Vec<LinkView>),
     Error(String),
 }
 
@@ -73,6 +73,16 @@ pub struct BasketView {
     pub name: String,
     pub id: String,
     pub cherries: Vec<CherryView>,
+}
+
+/// 一条链接，和它是哪个篮子的。
+///
+/// 链接里没有篮子名（它就是一个凭证，见 ADR-0002），所以列好几个的时候得把名字带上
+/// 才知道哪条是哪条。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkView {
+    pub name: String,
+    pub link: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,7 +211,24 @@ async fn dispatch_inner(svc: &Service, req: &Request) -> Result<Response> {
                 Some(h) => Some(Host::parse(h)?),
                 None => None,
             };
-            Ok(Response::Link(svc.link(basket, host).await?.to_string()))
+            // 不给篮子就是每个篮子一条。名字从 list_baskets 拿，链接本身没有篮子名。
+            let names: Vec<String> = match basket {
+                Some(name) => vec![name.clone()],
+                None => svc
+                    .list_baskets()
+                    .await
+                    .iter()
+                    .map(|b| b.name.clone())
+                    .collect(),
+            };
+            let mut out = Vec::with_capacity(names.len());
+            for name in names {
+                out.push(LinkView {
+                    link: svc.link(&name, host.clone()).await?.to_string(),
+                    name,
+                });
+            }
+            Ok(Response::Links(out))
         }
     }
 }
