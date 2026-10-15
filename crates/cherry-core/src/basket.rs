@@ -50,6 +50,14 @@ impl Basket {
 
     /// 放一颗 cherry 进篮子。名字在篮子内唯一；改名只改展示路径，不动源文件。
     pub fn add(&mut self, source: &Path) -> Result<Cherry> {
+        // 相对路径在这儿解析出来的是「相对于 /」——服务跑在 launchd 底下，cwd 就是 /。
+        // 那多半不是用户想的东西，宁可报错。客户端应该已经把它变成绝对路径了。
+        if !source.is_absolute() {
+            bail!(
+                "`{}` 是相对路径，只有客户端知道它指哪儿；篮子里记的必须是绝对路径",
+                source.display()
+            );
+        }
         let source = source
             .canonicalize()
             .with_context(|| format!("找不到 {}", source.display()))?;
@@ -115,6 +123,14 @@ mod tests {
         // 同一个源再加一次会被名字挡住。
         let err = b.add(&f).unwrap_err().to_string();
         assert!(err.contains("已经有一颗"), "{err}");
+    }
+
+    #[test]
+    fn 拒绝相对路径() {
+        // 服务这头的 cwd 是 /，相对路径在这儿只会解析成怪东西。
+        let mut b = Basket::new("test").unwrap();
+        let err = b.add(Path::new("docs")).unwrap_err().to_string();
+        assert!(err.contains("相对路径"), "{err}");
     }
 
     #[test]

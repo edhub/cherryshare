@@ -2,10 +2,12 @@
 //!
 //! 是**完整的**操作界面，不是给脚本用的子集：v1 没有 GUI（ADR-0004），全部操作都靠它。
 //! 它只是 local socket 上的一个消费者，语义判断一律不在这儿做（ADR-0003）。
+//! 唯一一件非它不可的事：把相对路径按**自己的** cwd 变成绝对路径——cherryd 跑在
+//! launchd 底下，cwd 是 `/`，它没法知道用户说的 `./docs` 是哪个目录。
 
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use cherry_control::{CherryView, Client, Request, Response};
 use cherry_core::BasketLink;
 use cherry_core::link::MountOs;
@@ -41,7 +43,7 @@ enum Cmd {
     Add {
         /// 篮子名
         basket: String,
-        /// 文件或文件夹的路径
+        /// 文件或文件夹的路径。相对路径按你现在所在的目录算；篮子里记的永远是绝对路径
         path: PathBuf,
     },
     /// 从篮子里拿走一颗
@@ -70,23 +72,45 @@ async fn main() -> Result<()> {
         None => cherry_core::service::default_data_dir()?,
     };
     let mut client = Client::connect(&data_dir).await?;
-    match client.call(&to_request(cli.cmd)).await? {
+    match client.call(&to_request(cli.cmd)?).await? {
         Response::Error(e) => bail!("{e}"),
         other => print(other),
     }
     Ok(())
 }
 
-fn to_request(cmd: Cmd) -> Request {
-    match cmd {
+fn to_request(cmd: Cmd) -> Result<Request> {
+    Ok(match cmd {
         Cmd::Status => Request::Status,
         Cmd::List => Request::ListBaskets,
         Cmd::New { name } => Request::CreateBasket { name },
         Cmd::Show { basket } => Request::ShowBasket { name: basket },
-        Cmd::Add { basket, path } => Request::AddCherry { basket, path },
+        Cmd::Add { basket, path } => Request::AddCherry {
+            basket,
+            path: absolute(path)?,
+        },
         Cmd::Rm { basket, name } => Request::RemoveCherry { basket, name },
         Cmd::Link { basket, host } => Request::Link { basket, host },
-    }
+    })
+}
+
+/// 把用户敲的路径变成绝对的、解析掉符号链接的路径。
+///
+/// 解析符号链接是因为服务那头本来就不对外提供符号链接（listing::servable），
+/// 记下 resolve 之后的路径，两边说的才是同一个东西。
+/// 顺带当存在性检查：篮子里存的路径得先活得过这一刻。报错时把按哪个目录算的说出来，
+/// 因为相对路径出错时人第一个想知道的就是这个。
+fn absolute(path: PathBuf) -> Result<PathBuf> {
+    std::fs::canonicalize(&path).with_context(|| {
+        if path.is_absolute() {
+            format!("找不到 {}", path.display())
+        } else {
+            let cwd = std::env::current_dir()
+                .map(|d| d.display().to_string())
+                .unwrap_or_else(|_| "?".into());
+            format!("找不到 {}（按当前目录 {cwd} 算的）", path.display())
+        }
+    })
 }
 
 fn print(resp: Response) {
