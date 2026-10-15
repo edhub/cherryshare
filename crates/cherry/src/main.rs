@@ -66,6 +66,12 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // `cherry … | head` 这种用法会让读的那头提前关掉管道。Rust 默认把 SIGPIPE 设成忽略，
+    // 于是 `println!` 写不进去时就 panic 出一段回溯。命令行程序该做的是按系统默认处理：
+    // 安静地死掉（退出码 141），跟 `ls | head` 一个样子。
+    // SAFETY: 只是把信号处理恢复成默认，没有别的副作用。
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+
     let cli = Cli::parse();
     // 挂载点的最后一段要用篮子名，而 `to_request` 会把 cmd 吃掉。
     let basket = match &cli.cmd {

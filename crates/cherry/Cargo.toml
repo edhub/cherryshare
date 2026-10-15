@@ -11,3 +11,4 @@ cherry-control.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+libc.workspace = true
