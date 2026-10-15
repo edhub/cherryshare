@@ -71,11 +71,7 @@ impl Basket {
             bail!("篮子里已经有一颗叫 `{name}` 的 cherry 了");
         }
 
-        let cherry = Cherry {
-            name,
-            source,
-            kind,
-        };
+        let cherry = Cherry { name, source, kind };
         self.cherries.push(cherry.clone());
         Ok(cherry)
     }

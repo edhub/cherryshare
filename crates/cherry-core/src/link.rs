@@ -181,9 +181,13 @@ impl FromStr for BasketLink {
             .strip_prefix("cherryshare:")
             .context("链接要以 `cherryshare:` 开头")?;
         // 从右边切最后一个 ':'，这样带冒号的 IPv6 也不会切错。
-        let (host, id_hex) = rest.rsplit_once(':').context("链接里没有地址和 id 的分隔")?;
+        let (host, id_hex) = rest
+            .rsplit_once(':')
+            .context("链接里没有地址和 id 的分隔")?;
         let host = host.trim_start_matches('[').trim_end_matches(']');
-        let host: IpAddr = host.parse().with_context(|| format!("`{host}` 不是合法地址"))?;
+        let host: IpAddr = host
+            .parse()
+            .with_context(|| format!("`{host}` 不是合法地址"))?;
         let basket_id =
             Self::parse_basket_id_hex(id_hex).context("链接里的 basket id 不是 32 位十六进制")?;
         Ok(Self { host, basket_id })
@@ -217,12 +221,13 @@ mod tests {
     #[test]
     fn 坏链接要说清楚哪里坏() {
         assert!("nope".parse::<BasketLink>().is_err());
-        assert!("cherryshare:1.2.3.4".parse::<BasketLink>().is_err(), "缺 id");
+        assert!(
+            "cherryshare:1.2.3.4".parse::<BasketLink>().is_err(),
+            "缺 id"
+        );
         let e = "cherryshare:nope:07".parse::<BasketLink>().unwrap_err();
         assert!(e.to_string().contains("合法地址"), "{e}");
-        let e = "cherryshare:1.2.3.4:zz"
-            .parse::<BasketLink>()
-            .unwrap_err();
+        let e = "cherryshare:1.2.3.4:zz".parse::<BasketLink>().unwrap_err();
         assert!(e.to_string().contains("32 位十六进制"), "{e}");
     }
 
@@ -272,12 +277,21 @@ mod tests {
 
     #[test]
     fn 篮子_id_的十六进制能来回() {
-        let id = [0x7f, 0xcb, 0xce, 0xab, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let id = [
+            0x7f, 0xcb, 0xce, 0xab, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+        ];
         let link = BasketLink::new(sample().host, id);
         assert_eq!(link.basket_id_hex().len(), 32);
-        assert_eq!(BasketLink::parse_basket_id_hex(&link.basket_id_hex()), Some(id));
+        assert_eq!(
+            BasketLink::parse_basket_id_hex(&link.basket_id_hex()),
+            Some(id)
+        );
         assert_eq!(BasketLink::parse_basket_id_hex("7fcbceab"), None, "短了");
-        assert_eq!(BasketLink::parse_basket_id_hex(&"z".repeat(32)), None, "不是十六进制");
+        assert_eq!(
+            BasketLink::parse_basket_id_hex(&"z".repeat(32)),
+            None,
+            "不是十六进制"
+        );
         assert_eq!(BasketLink::parse_basket_id_hex(""), None);
     }
 }

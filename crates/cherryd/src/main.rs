@@ -73,8 +73,8 @@ async fn run() -> Result<()> {
     let sock = cherry_control::socket_path(&data_dir);
     // 上一次没清干净的 socket 文件会让 bind 失败。
     let _ = std::fs::remove_file(&sock);
-    let listener = UnixListener::bind(&sock)
-        .with_context(|| format!("bind {} 失败", sock.display()))?;
+    let listener =
+        UnixListener::bind(&sock).with_context(|| format!("bind {} 失败", sock.display()))?;
     restrict_to_owner(&sock)?;
 
     // 局域网那条路：把篮子当只读 NFS 导出，对方的系统自带客户端就能挂。

@@ -195,7 +195,6 @@ fn load_baskets(data_dir: &Path) -> Result<Vec<Basket>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let s = std::fs::read_to_string(&path)
-        .with_context(|| format!("读不到 {}", path.display()))?;
+    let s = std::fs::read_to_string(&path).with_context(|| format!("读不到 {}", path.display()))?;
     serde_json::from_str(&s).with_context(|| format!("{} 解析失败", path.display()))
 }

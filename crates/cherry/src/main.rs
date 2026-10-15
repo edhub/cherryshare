@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use cherry_control::{CherryView, Client, Request, Response};
-use cherry_core::link::NFS_PORT;
 use cherry_core::BasketLink;
+use cherry_core::link::NFS_PORT;
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -113,8 +113,7 @@ fn mount(link: &str, mountpoint: Option<PathBuf>) -> Result<()> {
             .join("cherry")
             .join(&link.basket_id_hex()[..8]),
     };
-    std::fs::create_dir_all(&mnt)
-        .with_context(|| format!("建不出挂载点 {}", mnt.display()))?;
+    std::fs::create_dir_all(&mnt).with_context(|| format!("建不出挂载点 {}", mnt.display()))?;
 
     let port = NFS_PORT.to_string();
     let opts = format!("nolocks,vers=3,tcp,port={port},mountport={port},soft,actimeo=5");
@@ -127,10 +126,7 @@ fn mount(link: &str, mountpoint: Option<PathBuf>) -> Result<()> {
         .context("跑不起 mount_nfs")?;
     if !out.status.success() {
         // "不允许静默失败"：把 mount_nfs 的原话带出来。
-        bail!(
-            "挂载失败：{}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        bail!("挂载失败：{}", String::from_utf8_lossy(&out.stderr).trim());
     }
 
     println!("挂上了：{}", mnt.display());
@@ -152,7 +148,11 @@ fn print(resp: Response) {
             // 监听没起来就说出来，别让人以为分享是好的。
             println!(
                 "nfs        {nfs_port}  {}",
-                if nfs_up { "" } else { "（没起来：局域网挂载这条路不可用）" }
+                if nfs_up {
+                    ""
+                } else {
+                    "（没起来：局域网挂载这条路不可用）"
+                }
             );
         }
         Response::Baskets(list) => {

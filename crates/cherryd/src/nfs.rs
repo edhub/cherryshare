@@ -161,7 +161,6 @@ impl BasketNfs {
             ctime: t,
         }
     }
-
 }
 
 #[async_trait]
@@ -248,7 +247,12 @@ impl NFSFileSystem for BasketNfs {
         }
     }
 
-    async fn read(&self, id: fileid3, offset: u64, count: u32) -> Result<(Vec<u8>, bool), nfsstat3> {
+    async fn read(
+        &self,
+        id: fileid3,
+        offset: u64,
+        count: u32,
+    ) -> Result<(Vec<u8>, bool), nfsstat3> {
         let (basket, sub) = self.target(id).await?;
         let Some((path, meta)) = Self::disk_path(&basket, &sub).await? else {
             // 篮子根是目录。

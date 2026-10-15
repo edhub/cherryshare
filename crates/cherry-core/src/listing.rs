@@ -157,8 +157,8 @@ pub fn resolve(basket: &Basket, path: &str) -> Result<(PathBuf, std::fs::Metadat
 /// `None` 表示这个条目不共享（符号链接、设备之类），调用方跳过它并说一声。
 fn entry(name: &str, full: &std::path::Path) -> Result<Option<Entry>> {
     // 必须用 `symlink_metadata`：`metadata` 会跟随链接，就看不出它是链接了。
-    let meta = std::fs::symlink_metadata(full)
-        .with_context(|| format!("stat {} 失败", full.display()))?;
+    let meta =
+        std::fs::symlink_metadata(full).with_context(|| format!("stat {} 失败", full.display()))?;
     let Some(kind) = servable(&meta) else {
         return Ok(None);
     };
@@ -292,7 +292,10 @@ mod tests {
 
         // 指到外面的：规范化之后不在 cherry 里面了。
         let e = resolve(&b, &format!("{root}/escape")).unwrap_err();
-        assert!(e.to_string().contains("共享范围外面"), "报错要说清爬出去了: {e}");
+        assert!(
+            e.to_string().contains("共享范围外面"),
+            "报错要说清爬出去了: {e}"
+        );
         // 指到里面的：落在范围内，但请求的那段和磁盘上那段不是一个名字。
         let e = resolve(&b, &format!("{root}/inside")).unwrap_err();
         assert!(e.to_string().contains("符号链接"), "报错要说清是链接: {e}");
@@ -302,8 +305,14 @@ mod tests {
             .into_iter()
             .map(|e| e.name)
             .collect();
-        assert!(!names.contains(&"escape".to_owned()), "列目录不该出现: {names:?}");
-        assert!(!names.contains(&"inside".to_owned()), "列目录不该出现: {names:?}");
+        assert!(
+            !names.contains(&"escape".to_owned()),
+            "列目录不该出现: {names:?}"
+        );
+        assert!(
+            !names.contains(&"inside".to_owned()),
+            "列目录不该出现: {names:?}"
+        );
         let _ = std::fs::remove_file(&outside);
     }
 }
