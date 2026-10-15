@@ -16,9 +16,9 @@ debug = true
 strip = "none"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-# 1.91 是 iroh-mdns-address-lookup 0.6 的下限。
+# 依赖里要求最高的那个（最早是 iroh-mdns-address-lookup 0.6 的下限，那套已经删了，这个值没重新量过）。
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 

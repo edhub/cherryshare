@@ -12,6 +12,10 @@
 //! **所有磁盘操作都走 `spawn_blocking`。** cherryd 的 tokio worker 默认只有 1 个
 //! （见 [`crate::runtime`]），一个阻塞的 `stat` 会把整个守护进程卡住——包括同时
 //! 在跑的 basket 管理请求。
+//!
+//! **句柄跨重启稳定。** fileid 是路径的哈希，句柄就用它；篮子根额外一种形态：把 128 位
+//! 篮子 id 直接放进句柄。这样服务重启之后，对方**已经挂着的**那个点不用重挂——要么照常，
+//! 要么个别句柄报一次 `STALE`，客户端按名字重新 lookup 就回来了。理由见 [`BasketNfs::id_to_fh`]。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -21,7 +25,7 @@ use async_trait::async_trait;
 use cherry_core::listing::{self, Entry};
 use cherry_core::{Basket, CherryKind, Service};
 use nfsserve::nfs::{
-    fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3,
+    fattr3, fileid3, filename3, ftype3, nfs_fh3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3,
 };
 use nfsserve::tcp::NFSTcpListener;
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
@@ -45,11 +49,13 @@ pub struct BasketNfs {
 
 /// fileid ↔（篮子 id，篮子内相对路径）的映射。
 ///
-/// 客户端会缓存 fileid（它就是 NFS 的 inode 号），所以同一个路径必须永远拿到同一个 id。
-/// 反过来，一个 id 指向的文件被删了就该报 `STALE`，让客户端丢掉句柄。
+/// **fileid 是路径的哈希，不是进程内自增的计数器。** 这一条是为了让服务重启之后客户端
+/// 手里的句柄还有意义：自增的话新进程会从头重发同样的号，而客户端缓存里那些号指的是别的
+/// 路径，于是老句柄会**悄悄解析成另一个文件**（读 `bin/` 拿到 `errors.md` 的内容）——
+/// 这比报错糟得多。哈希让同一个路径在任何进程里都是同一个号：老句柄要么解析到同一个
+/// 对象，要么解析不了报 `STALE`，绝不会指到别人身上。
 #[derive(Default)]
 struct Arena {
-    next: fileid3,
     by_id: HashMap<fileid3, Key>,
     by_key: HashMap<Key, fileid3>,
 }
@@ -58,21 +64,44 @@ struct Arena {
 type Key = ([u8; 16], String);
 
 impl Arena {
-    fn intern(&mut self, key: Key) -> fileid3 {
+    fn intern(&mut self, key: Key) -> Result<fileid3, nfsstat3> {
         if let Some(&id) = self.by_key.get(&key) {
-            return id;
+            return Ok(id);
         }
-        // 0 是全局根，不分配出去（nfsserve 的约定）。
-        self.next += 1;
-        let id = self.next;
+        let id = hash_key(&key);
+        // 撞了不能糊过去：一个号指向两个路径的话，客户端拿到的是别人。64 位哈希上
+        // 这不该发生，真发生了要响亮。
+        if let Some(other) = self.by_id.get(&id) {
+            tracing::error!(id, ?key, ?other, "fileid 撞了，这个路径先不给");
+            return Err(nfsstat3::NFS3ERR_STALE);
+        }
         self.by_key.insert(key.clone(), id);
         self.by_id.insert(id, key);
-        id
+        Ok(id)
     }
 
     fn key(&self, id: fileid3) -> Option<&Key> {
         self.by_id.get(&id)
     }
+}
+
+/// 路径 → fileid：FNV-1a，64 位。
+///
+/// 自己写一个固定哈希而不是用 `DefaultHasher`：后者只保证同一个二进制里一致，
+/// Rust 一升级就可能换实现，那样连篮子根的句柄都会失效。
+fn hash_key((basket_id, sub): &Key) -> fileid3 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    // 在 id 和路径之间插一个 0：免得出"id 的尾巴拼上路径"和"另一个 id 加上另一条路径"撞到一起。
+    let bytes = basket_id
+        .iter()
+        .copied()
+        .chain(std::iter::once(0))
+        .chain(sub.bytes());
+    for b in bytes {
+        h = (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
+    }
+    // 0 留给"全局根"那个占位（nfsserve 的约定），别让它落在这儿。
+    if h == 0 { 1 } else { h }
 }
 
 impl BasketNfs {
@@ -174,6 +203,55 @@ impl NFSFileSystem for BasketNfs {
         0
     }
 
+    /// 句柄就是 fileid 本身；只有篮子根例外，它把自己的 128 位 id 放进去。
+    ///
+    /// **不用 nfsserve 默认那一套**：默认往句柄里塞一个「每进程生成一次」的 generation
+    /// number（`SystemTime::now().as_millis()`），所以服务一重启，客户端手里的句柄全部作废，
+    /// 报 `STALE`，对方得重新挂载。我们的 fileid 是路径哈希，本来就跨进程稳定，不需要那个。
+    ///
+    /// **篮子根为什么要单独一种形态**：新进程里谁都还没 intern 过它，而它是唯一一个**必须**
+    /// 能被「冷」解析的——客户端够任何东西、走哪条路径，都从这个句柄开始。而哈希不可逆，我们
+    /// 没法从 64 位反推出是哪个篮子；干脆把篮子 id 本身放进去（它本来就在挂载路径里明文传，
+    /// 不算多泄露）。
+    ///
+    /// 剩下的缺口：非根句柄冷着拿过来只能报 `STALE`，因为同样反推不出来。实践中客户端会按
+    /// 名字重新 lookup（名字→句柄的缓存寿命是挂载时的 `acdirmax`），所以顶多错一下；但**已经
+    /// 打开的文件**手里那个句柄是跑不掉的，那边的 `cp`/`rsync` 得重来。
+    fn id_to_fh(&self, id: fileid3) -> nfs_fh3 {
+        let basket_root = {
+            let ids = self.ids.lock().unwrap();
+            ids.key(id)
+                .and_then(|(b, sub)| sub.is_empty().then_some(*b))
+        };
+        let data = match basket_root {
+            Some(basket_id) => basket_id.to_vec(),
+            None => id.to_le_bytes().to_vec(),
+        };
+        nfs_fh3 { data }
+    }
+
+    /// [`BasketNfs::id_to_fh`] 的反函数。
+    fn fh_to_id(&self, fh: &nfs_fh3) -> Result<fileid3, nfsstat3> {
+        match fh.data.len() {
+            // 篮子根：把 key 造出来，intern 一下就得到那个（稳定的）fileid。
+            // 篮子不存在的话，后面真正处理请求时会报错，这里不管。
+            16 => {
+                let basket_id: [u8; 16] = fh.data[..].try_into().unwrap();
+                self.ids.lock().unwrap().intern((basket_id, String::new()))
+            }
+            8 => {
+                let id = fileid3::from_le_bytes(fh.data[..].try_into().unwrap());
+                if self.ids.lock().unwrap().key(id).is_some() {
+                    Ok(id)
+                } else {
+                    // 这条路径本进程还没见过。不去猜（也猜不出来），让客户端按名字重新 lookup。
+                    Err(nfsstat3::NFS3ERR_STALE)
+                }
+            }
+            _ => Err(nfsstat3::NFS3ERR_BADHANDLE),
+        }
+    }
+
     /// MNT 请求里的路径。这是唯一的门禁点。
     async fn path_to_id(&self, path: &[u8]) -> Result<fileid3, nfsstat3> {
         let s = std::str::from_utf8(path).map_err(|_| nfsstat3::NFS3ERR_NOENT)?;
@@ -195,7 +273,7 @@ impl NFSFileSystem for BasketNfs {
         if !sub.is_empty() {
             Self::disk_path(&basket, sub).await.map(|_| ())?;
         }
-        Ok(self.ids.lock().unwrap().intern((id, sub.to_owned())))
+        Ok(self.ids.lock().unwrap().intern((id, sub.to_owned()))?)
     }
 
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
@@ -223,7 +301,7 @@ impl NFSFileSystem for BasketNfs {
         if !child.is_empty() {
             Self::disk_path(&basket, &child).await.map(|_| ())?;
         }
-        Ok(self.ids.lock().unwrap().intern((basket.id, child)))
+        Ok(self.ids.lock().unwrap().intern((basket.id, child))?)
     }
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
@@ -304,7 +382,7 @@ impl NFSFileSystem for BasketNfs {
             } else {
                 format!("{sub}/{}", e.name)
             };
-            let fid = ids.intern((basket.id, child));
+            let fid = ids.intern((basket.id, child))?;
             let attr = Self::fattr(
                 fid,
                 matches!(e.kind, CherryKind::Dir),
@@ -420,10 +498,64 @@ mod tests {
     fn 同一个路径永远拿到同一个_fileid() {
         let mut a = Arena::default();
         let k = ([0u8; 16], "sub/file".to_owned());
-        let first = a.intern(k.clone());
-        assert_eq!(a.intern(k.clone()), first);
+        let first = a.intern(k.clone()).unwrap();
+        assert_eq!(a.intern(k.clone()).unwrap(), first, "同一个路径同一个号");
         assert_ne!(first, 0, "0 要留给全局根");
-        assert_eq!(a.intern(([0u8; 16], String::new())), first + 1);
+        // 换个路径、换个篮子都得换号。
+        assert_ne!(a.intern(([0u8; 16], String::new())).unwrap(), first);
+        assert_ne!(a.intern(([1u8; 16], "sub/file".to_owned())).unwrap(), first);
+        assert_eq!(a.key(first), Some(&k));
+    }
+
+    #[test]
+    fn id_是路径的哈希_所以重启后还是同一个() {
+        // 这条是整套设计的全部理由：换一个进程（新的 Arena）算出来必须一样。
+        // 要是自增的话，新进程会把同一个号发给另一条路径，客户端手里的老句柄就会静默指错。
+        let k = ([7u8; 16], "bin/cherry".to_owned());
+        let mut a = Arena::default();
+        let mut b = Arena::default();
+        assert_eq!(a.intern(k.clone()).unwrap(), b.intern(k).unwrap());
+    }
+
+    #[tokio::test]
+    async fn 篮子根的句柄换个进程还认得() {
+        let dir = std::env::temp_dir().join(format!("cherry-nfs-fh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let svc = Service::start(dir.clone()).await.unwrap();
+        let b = svc.create_basket("t").await.unwrap();
+        let nfs = BasketNfs {
+            svc: svc.clone(),
+            ids: Mutex::new(Arena::default()),
+        };
+
+        let hex: String = b.id.iter().map(|x| format!("{x:02x}")).collect();
+        let id = nfs.path_to_id(format!("/{hex}").as_bytes()).await.unwrap();
+        let fh = nfs.id_to_fh(id);
+        assert_eq!(fh.data, b.id.to_vec(), "篮子根的句柄里就是篮子 id");
+
+        // 模拟服务重启：换一个空白的 Arena（新进程），拿同一个句柄过来。
+        let fresh = BasketNfs {
+            svc: svc.clone(),
+            ids: Mutex::new(Arena::default()),
+        };
+        assert_eq!(fresh.fh_to_id(&fh).unwrap(), id, "重启之后还是同一个号");
+
+        // 非根的冷句柄认不出来——不猜，报 STALE，让客户端按名字重新 lookup。
+        let cold = nfs_fh3 {
+            data: 12_345u64.to_le_bytes().to_vec(),
+        };
+        assert!(matches!(
+            fresh.fh_to_id(&cold),
+            Err(nfsstat3::NFS3ERR_STALE)
+        ));
+        // 长度不对的句柄是 BADHANDLE。
+        assert!(matches!(
+            fresh.fh_to_id(&nfs_fh3 {
+                data: vec![1, 2, 3]
+            }),
+            Err(nfsstat3::NFS3ERR_BADHANDLE)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
