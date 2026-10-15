@@ -36,7 +36,7 @@
 | 拥塞控制 BBR3 | 干净链路上 90 vs 78 Mbit/s，无优势 |
 | **逐包系统调用** | 批量 10 倍（`MAX_TRANSMIT_SEGMENTS`）只换来 +8.9% |
 | **逐包 cmsg** | 给 1452 字节的 `sendmsg` 加 `IP_TOS` / `IP_PKTINFO` cmsg：5.06 / 5.08 µs，
-与不带（4.96）**没区别**。noq 每个包都带 cmsg，**但那不是成本** |
+与不带（4.96）**没区别**。noq 每个包都带 cmsg，**但那不是成本**（基准见下一节）|
 | **pacing 突发大小** | 改 `noq-proto` 的 `TARGET_BURST_INTERVAL` 2ms → 20ms / 100ms（突发大 10~50 倍）：
 CPU 2.38 / 2.35 / 2.36 核，**无差别**。pacing 不是杠杆 |
 | **裸 UDP 能省下 `__sendmsg` 的钱** | 错。裸 UDP（一次 `sendmsg`/包，1452 字节）是 **5 µs/包**，
@@ -254,8 +254,15 @@ blob 传输）。摊到多个核上只会付**任务迁移 + 跳核唤醒 + 工�
 
 ## 那剩下的 ~6 倍：**已知、未解释、便宜手段已用尽**
 
-把 W=1 + ACK 两个旋钮打开后，cherry 的每字节 CPU 从 ~41 ns 降到 **22.5 ns**。
-但离裸 UDP 的 ~3.5 ns 还有 **~6 倍**（且这已按 4 次 syscall 的正确口径折算）。
+先得有基准线。**裸 UDP 只发一个 `sendmsg`（1452 字节）时，两端合计 ~4 µs/包**
+（= ~3.5 ns/字节），用标准工具就能复现：
+
+```
+iperf3 -s -1 & iperf3 -c 127.0.0.1 -u -l 1452 -b 0 -t 5      # → 3.97 µs/包
+```
+
+把 W=1 + ACK 两个旋钮打开后，cherry 的每字节 CPU 从 ~41 ns 降到 **22.5 ns**，
+但离那个基准还有 **~6 倍**（已按 4 次 syscall 的正确口径折算）。
 
 **位置**：同一个 `sendmsg`/`__recvmsg`，在 cherry 的条件下内核要多花时间——
 不在用户态协议逻辑里（传输层旋钮全部试过，见「已排除的」那张表）。
@@ -285,9 +292,10 @@ blob 传输）。摊到多个核上只会付**任务迁移 + 跳核唤醒 + 工�
 | "瓶颈在传输层" | 错。把传输层的旋钮试遍了（cmsg、pacing、GSO、多连接、MTU、CC）都无效，**杠杆在运行时** |
 | "`sample` 不能用，`xctrace` 能用" | 只对一半。xctrace 不采阻塞线程（这点对），但对多线程守护进程**少采 4 倍** |
 
-## 复现用的本地补丁与工具
+## 复现用的本地补丁
 
-临时补丁试完就撤了，都没进仓库：
+三个临时补丁试完就撤了，都没进仓库。这里记的是**改哪里、怎么接**，
+比存一个补丁文件耐留：
 
 - `iroh`：暴露 `IROH_MAX_UDP_PAYLOAD`（`iroh/src/socket.rs` 里 `endpoint_config` 之后）
 - `netwatch`：调 `UdpSocketState::set_apple_fast_path()`（`netwatch/src/udp.rs` 的
@@ -298,13 +306,3 @@ blob 传输）。摊到多个核上只会付**任务迁移 + 跳核唤醒 + 工�
 用 `[patch.crates-io]` 指向本地路径接进来。注意 `iroh` 的 patch 必须连带
 `iroh-base` / `iroh-relay` / `iroh-dns` 一起，否则图里会出现两个 `iroh-base`，
 `iroh::PublicKey` 和 `iroh_base::PublicKey` 会被当成不同类型。
-
-**对照用的裸 UDP harness**（写在 `/tmp/udpbench`，~60 行，**临时没进仓库**）：一次 `sendmsg`
-发 1452 字节，收发在同一进程，用 `RUSAGE_SELF` 取两端合计 CPU，可选 cmsg、pacing、
-socket 缓冲区大小。它只用来加那几个可变项；**基准线本身用标准工具就能复现**：
-
-```
-iperf3 -s -1 & iperf3 -c 127.0.0.1 -u -l 1452 -b 0 -t 5      # → 3.97 µs/包
-```
-
-两边互相印证（5.0 vs 3.97），所以那个基准线不是 harness 的怪癖。
