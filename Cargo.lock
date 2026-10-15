@@ -125,7 +125,6 @@ dependencies = [
  "cherry-control",
  "cherry-core",
  "clap",
- "dirs",
  "tokio",
 ]
 

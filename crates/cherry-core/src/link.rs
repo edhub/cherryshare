@@ -25,6 +25,17 @@ pub struct BasketLink {
     pub basket_id: [u8; 16],
 }
 
+/// 对方那边是什么系统。
+///
+/// **两个系统都得给，因为对方的机器我们不知道**，而这条链接就是唯一的口子：
+/// `cherry mount` 已经删了（ADR-0007 决策七），没有第二条路。两边差别不只是多不多一个 s：
+/// 选项名一个 `nolocks` 一个 `nolock`，Linux 挂载还要 root。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountOs {
+    Macos,
+    Linux,
+}
+
 impl BasketLink {
     pub fn new(host: IpAddr, basket_id: [u8; 16]) -> Self {
         Self { host, basket_id }
@@ -48,16 +59,32 @@ impl BasketLink {
         }
     }
 
-    /// 能直接粘进终端的一行挂载命令。
+    /// 对方要粘的那一行命令（`mkdir` 和挂载串在一起，粘一次就行）。
     ///
     /// `actimeo=5` 是属性缓存秒数：它决定创建者增删一颗 cherry 之后对方多久看得见。
     /// 给小一点贴合"篮子里的东西是活的"这个语义，代价是往返变多。
-    pub fn mount_command(&self, mountpoint: &str) -> String {
+    ///
+    /// `nolocks` / `nolock`：关掉 NLM 锁。我们不跑锁服务（也不需要——导出是只读的），
+    /// 不关的话客户端会先去找一遍 portmapper，白白多一跳甚至挂不上。
+    pub fn mount_command(&self, os: MountOs, mountpoint: &str) -> String {
         let port = NFS_PORT;
+        let (mk, prog, locks) = match os {
+            MountOs::Macos => ("mkdir -p", "mount_nfs", "nolocks"),
+            // Linux 上挂载要 root，而 `-t nfs` 是 mount(8) 的用法。
+            MountOs::Linux => ("sudo mkdir -p", "sudo mount -t nfs", "nolock"),
+        };
         format!(
-            "mkdir -p {mountpoint} && mount_nfs -o nolocks,vers=3,tcp,port={port},mountport={port},soft,actimeo=5 {} {mountpoint}",
+            "{mk} {mountpoint} && {prog} -o {locks},vers=3,tcp,port={port},mountport={port},soft,actimeo=5 {} {mountpoint}",
             self.mount_source()
         )
+    }
+
+    /// 卸掉。macOS 上普通人就能卸，Linux 上要 root。
+    pub fn unmount_command(os: MountOs, mountpoint: &str) -> String {
+        match os {
+            MountOs::Macos => format!("umount {mountpoint}"),
+            MountOs::Linux => format!("sudo umount {mountpoint}"),
+        }
     }
 }
 
@@ -269,10 +296,35 @@ mod tests {
     #[test]
     fn 挂载命令里带地址和_id() {
         let link = sample();
-        let cmd = link.mount_command("~/cherry/x");
-        assert!(cmd.contains("192.168.8.195:/"), "{cmd}");
-        assert!(cmd.contains(&link.basket_id_hex()), "{cmd}");
-        assert!(cmd.contains(&format!("port={NFS_PORT}")), "{cmd}");
+        for os in [MountOs::Macos, MountOs::Linux] {
+            let cmd = link.mount_command(os, "~/cherry/x");
+            assert!(cmd.contains("192.168.8.195:/"), "{cmd}");
+            assert!(cmd.contains(&link.basket_id_hex()), "{cmd}");
+            assert!(cmd.contains(&format!("port={NFS_PORT}")), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn 两个系统的挂载命令不一样() {
+        let link = sample();
+        let mac = link.mount_command(MountOs::Macos, "/mnt/x");
+        let lin = link.mount_command(MountOs::Linux, "/mnt/x");
+        assert!(mac.contains("nolocks"), "{mac}");
+        assert!(lin.contains("nolock,"), "{lin}");
+        assert!(!lin.contains("nolocks"), "Linux 的选项名不带 s：{lin}");
+        assert!(mac.contains("mount_nfs"), "{mac}");
+        assert!(
+            lin.contains("sudo mount -t nfs"),
+            "Linux 上挂载要 root：{lin}"
+        );
+        assert_eq!(
+            BasketLink::unmount_command(MountOs::Macos, "/mnt/x"),
+            "umount /mnt/x"
+        );
+        assert_eq!(
+            BasketLink::unmount_command(MountOs::Linux, "/mnt/x"),
+            "sudo umount /mnt/x"
+        );
     }
 
     #[test]

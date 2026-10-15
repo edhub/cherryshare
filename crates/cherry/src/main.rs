@@ -5,10 +5,10 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use cherry_control::{CherryView, Client, Request, Response};
 use cherry_core::BasketLink;
-use cherry_core::link::NFS_PORT;
+use cherry_core::link::MountOs;
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -59,23 +59,11 @@ enum Cmd {
         #[arg(long)]
         host: Option<String>,
     },
-    /// 挂上对方分享的篮子。不需要本机跑服务
-    Mount {
-        /// BasketLink
-        link: String,
-        /// 挂到哪儿。不给就是 ~/cherry/<id 前 8 位>
-        mountpoint: Option<PathBuf>,
-    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-
-    // 挂载是纯客户端动作：对方的系统自带 NFS 客户端，本机不需要服务。
-    if let Cmd::Mount { link, mountpoint } = cli.cmd {
-        return mount(&link, mountpoint);
-    }
 
     let data_dir = match cli.data_dir {
         Some(d) => d,
@@ -98,40 +86,7 @@ fn to_request(cmd: Cmd) -> Request {
         Cmd::Add { basket, path } => Request::AddCherry { basket, path },
         Cmd::Rm { basket, name } => Request::RemoveCherry { basket, name },
         Cmd::Link { basket, host } => Request::Link { basket, host },
-        // main 里提前返回了。
-        Cmd::Mount { .. } => unreachable!(),
     }
-}
-
-/// 把对方的篮子挂到本机。命令行就是链接里那些参数拼出来的（ADR-0002）。
-fn mount(link: &str, mountpoint: Option<PathBuf>) -> Result<()> {
-    let link: BasketLink = link.parse().context("链接看不懂")?;
-    let mnt = match mountpoint {
-        Some(p) => p,
-        None => dirs::home_dir()
-            .context("找不到 home 目录")?
-            .join("cherry")
-            .join(&link.basket_id_hex()[..8]),
-    };
-    std::fs::create_dir_all(&mnt).with_context(|| format!("建不出挂载点 {}", mnt.display()))?;
-
-    let port = NFS_PORT.to_string();
-    let opts = format!("nolocks,vers=3,tcp,port={port},mountport={port},soft,actimeo=5");
-    let out = std::process::Command::new("mount_nfs")
-        .arg("-o")
-        .arg(&opts)
-        .arg(link.mount_source())
-        .arg(&mnt)
-        .output()
-        .context("跑不起 mount_nfs")?;
-    if !out.status.success() {
-        // "不允许静默失败"：把 mount_nfs 的原话带出来。
-        bail!("挂载失败：{}", String::from_utf8_lossy(&out.stderr).trim());
-    }
-
-    println!("挂上了：{}", mnt.display());
-    println!("（只读。想卸掉：`umount {}`）", mnt.display());
-    Ok(())
 }
 
 fn print(resp: Response) {
@@ -175,16 +130,21 @@ fn print(resp: Response) {
         Response::Link(l) => {
             println!("{l}");
             println!();
-            println!("把这条发给对方。");
+            println!("把这条发给对方。他什么都不用装，在同一个局域网里粘对应的一行：");
             if let Ok(link) = l.parse::<BasketLink>() {
-                let mnt = format!("~/cherry/{}", &link.basket_id_hex()[..8]);
                 println!();
-                println!("他装了 cherry：");
-                println!("  cherry mount {l}");
-                println!();
-                println!("他没装，就在同一个局域网，粘这两行：");
-                println!("  {}", link.mount_command(&mnt));
-                println!("  umount {mnt}");
+                for (os, name, mnt) in [
+                    (
+                        MountOs::Macos,
+                        "macOS",
+                        format!("~/cherry/{}", &link.basket_id_hex()[..8]),
+                    ),
+                    (MountOs::Linux, "Linux", "/mnt/cherry".to_owned()),
+                ] {
+                    println!("  {name}");
+                    println!("    {}", link.mount_command(os, &mnt));
+                    println!("    卸掉：{}", BasketLink::unmount_command(os, &mnt));
+                }
 
                 // 自动挑的那个未必是对方能到的（有 VPN、有虚拟机网桥的时候），
                 // 所以把其余候选也印出来。
