@@ -3,22 +3,23 @@
 | 编号 | 标题 | 状态 |
 | --- | --- | --- |
 | [0001](0001-basket-model.md) | basket 的模型与边界 | Accepted |
-| [0002](0002-basket-access.md) | basket 的访问方式 | Accepted |
+| [0002](0002-basket-access.md) | basket 的访问方式 | Accepted（2026-10-15 重写） |
 | [0003](0003-runtime-model.md) | 运行时模型 | Accepted |
-| [0004](0004-ui-form.md) | UI 形态 | Accepted |
-| [0005](0005-transport-stays-on-iroh.md) | 传输层留在 iroh / QUIC 上 | Accepted |
-| [0006](0006-mount-data-path.md) | mount 的数据路径 | Accepted |
+| [0004](0004-ui-form.md) | UI 形态 | **Deferred**（v1 不做 GUI） |
+| [0007](0007-lan-nfs-export.md) | 局域网这条主路走只读 NFS 导出 | Accepted |
+
+**已删除**：0005（传输留在 iroh / QUIC 上）、0006（mount 的数据路径）。两份都是为 iroh 那条传输服务的，而那条路已经删掉。删了什么、为什么、以及哪些部分被救回来挪到了别处，见 ADR-0007 的「删掉了什么」。
 
 ## 术语
 
-项目叫 **CherryShare**：CLI 是 `cherry`，服务是 `cherryd`，挂载是 `cherry-mount`。分享单位叫 **basket**，篮子里装的是 **cherry**。
+项目叫 **CherryShare**：CLI 是 `cherry`，服务是 `cherryd`。分享单位叫 **basket**，篮子里装的是 **cherry**。
 
 - **basket** —— 用户创建的分享单位。创建者是其中所有内容的唯一源。它是一篮 cherry，不是目录：文件留在原处，basket 里只记录引用。
 - **cherry** —— basket 里的一颗：`名字 + 源路径 + 类型（文件 / 文件夹）`。名字在 basket 内唯一，默认取原文件名。
-- **BasketLink** —— 分享用的那条链接：`{ addr: EndpointAddr, basket_id: [u8; 16] }`。
-- **目录（listing）** —— **一个目录**的内容清单：`(名字, 种类, size, mtime)`。由创建者现算，不是制品，也不含 hash。（ADR-0006 之前是「由 cherry 展开出的整棵树」；改成一个目录，因为 FUSE 的 `readdir` 本来就是按目录的。）
-- **服务** —— 持有全部状态的常驻进程（identity key、blobs store、索引缓存、basket 配置）。由系统拉起，独占这份清单。
-- **客户端** —— 通过 local socket 使用服务的东西：GUI、CLI、mount。都不持有状态。
+- **BasketLink** —— 分享用的那条链接：文本形态 `cherryshare:<host>:<32 位十六进制>`，也就是 `{ host: IpAddr, basket_id: [u8; 16] }`。`basket_id` 是凭证（ADR-0002）。
+- **目录（listing）** —— **一个目录**的内容清单：`(名字, 种类, size, mtime)`。由创建者现算，不是制品。按目录而不是整棵树，因为 NFS 的 `readdir` 本来就是按目录问的（ADR-0002）。
+- **服务** —— 持有全部状态的常驻进程（basket 配置、`basket_id`，以及 NFS 导出的那个监听端口）。由系统拉起，独占这份清单。
+- **客户端** —— 通过 local socket 使用服务的东西：现在只有 CLI。不持有状态。**挂载不由我们写**：创建者讲 NFS，对方的**内核**去挂（ADR-0007）。
 
 ## 刻意没有什么
 
@@ -29,7 +30,7 @@
 - 账号、登录、身份系统
 - 成员表、成员发现、入群审批
 - 做种 / 常驻缓存节点 / 可用性广播
-- 跨 basket 内容去重、多源下载（多源 ≠ 多流：对同一个源并发取不同区间是允许的）
+- 跨 basket 内容去重、多源下载（多源 ≠ 多流）
 - 服务端、中心目录、DHT
 
 **因为不是多写者协作**
@@ -37,36 +38,40 @@
 - `iroh-docs` / CRDT / gossip 广播树
 - 目录的签名、版本号、本地缓存——目录是响应，不是制品
 
-**因为自用、小范围、局域网优先**
+**因为自用、小范围、局域网是主路**
 
 - 沙盒与 App Store 分发
-- 自建 relay；离线可用性（"对方必须在线"是产品定位，不是缺陷）
+- 离线可用性（"对方必须在线"是产品定位，不是缺陷）
 - token 兑换层、次数预算、把限流当访问控制
 
 **因为不碰 web**
 
-- HTTP 服务、端口、token、runtime 文件、SSE、跨进程版本协商
+- HTTP 服务，以及随之而来的一整套本机攻击面：监听端口、token、runtime 文件、Host 校验、CSRF
 - 浏览器能打开的 UI
 
 **因为不需要**
 
-- 扫描用的文件监听器——**索引缓存让「比对」变成一次 `stat`，监听器没有用武之地**；而且监听器本身不可信（停过、丢事件、网络卷），必须配周期重扫兜底。完整理由见 ADR-0006
-- store 的 pin / GC 生命周期——store 里没有"只此一份"的数据
+- 扫描用的文件监听器——触发点就是请求本身。而且监听器本身不可信（停过、丢事件、网络卷），必须配周期重扫兜底，那照样得写扫描缓存，它只把延迟从几秒缩到毫秒；它唯一多买的是延迟，而 ADR-0001 担心的是**无界的**陈旧。
+- 服务端的缓存、内容寻址、按范围读——创建者读的就是用户那个文件本身，没有副本要管（ADR-0007 决策六）。
 
-**因为留在 iroh / QUIC 上**（ADR-0005）
+**因为传输就是 NFS**（ADR-0007）
 
-- 自研 TCP 传输层
-- QUIC-over-TCP（队头阻塞 + 用户态开销一分不省）
+- 自研传输层（跨网那边也一样：加回一个现成的端口转发，不是自己写一套）
+- SMB（它要凭证或访客配置，而 `basket_id` 已经是凭证）
+- 缩短 `basket_id`——它要的是不可猜测性，不是唯一性
+- **跨网**（现在不做）。将来要加的是**一个端口转发**，不是一套新的数据协议。
 
 ## 其他文档
 
 - [`../errors.md`](../errors.md) —— 失败清单。
-- [`../performance.md`](../performance.md) —— 性能调查记录（已排除清单、实测数据、自我更正）。
-- [`../../spikes/gpui-ui/`](../../spikes/gpui-ui/) —— gpui-kit 的验证 spike（ADR-0004 的依据）。
+- [`../performance.md`](../performance.md) —— 一次关于 iroh 传输的调查，那条传输已经删了；留着的两样东西按 ADR-0007 的说法：测量方法论，和一张"哪些路已经堵死"的负面地图。
+- [`../../spikes/gpui-ui/`](../../spikes/gpui-ui/) —— gpui-kit 的验证 spike。GUI 推迟了（ADR-0004），这些数据留着，将来真要做时不用重跑。
 
 ## 已推迟
 
+- **跨网**：需要一个端口转发（ADR-0007 决策六）。不做之前，这条产品线就是"同一个局域网内"。
+- **GUI**：v1 不做，CLI 是完整的操作界面。将来真要做的话按 ADR-0004 那三条来（原生 Rust，不走本机 HTTP）。spike 已经在那里了。
 - **basket 的命名**（给 basket 起一个人可读的名字）。次要，暂不设计。
 - **隐藏文件的默认处理**：创建者分享一个文件夹时，是否默认跳过以 `.` 开头的文件和目录（macOS 上任意文件夹都带 `.DS_Store`）。
-- **macOS 路径授权的提示名义**、**退出时的 UX（菜单栏 / 开机自启）**、**local socket 的具体协议**、**identity key 的导出与恢复**。（记在 ADR-0003）
-- **挂载的机制与策略**：macFUSE / FUSE-T / NFS loopback / File Provider 选哪个，inode 策略、块大小、预读、网络超时、**`entry_timeout` / `attr_timeout` 的具体取值**、xattr。真要动手时单独写 `docs/mount.md`。
+- **macOS 路径授权的提示名义**。（记在 ADR-0003）
+- **NFS 导出的具体参数**：挂载命令里的 `actimeo` 取值（现在给的是 5 秒）、端口被占时怎么办（现在是响亮的启动失败）。真要动手时单独写 `docs/mount.md`。

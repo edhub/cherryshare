@@ -5,8 +5,12 @@
 //!
 //! `list_dir` 只做廉价的那一半：遍历 + stat，不算 hash（那在 `GetFile` 时才做）。
 //! 所以打开一个目录总是很快，哪怕创建者刚改了几十 GB。
+//!
+//! **共享的只有真文件和真目录。** 符号链接不共享：一个指向别处的链接等于绕开了
+//! `..` 的封锁，而两者都是「爬出共享树」。判断只有一处（[`servable`]），列目录和
+//! 问单个条目两条路都必须问它——不然同一件事会有两种说法，客户端拿到自相矛盾的属性。
 
-use std::path::{Component, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -20,7 +24,7 @@ pub struct Entry {
     pub kind: CherryKind,
     /// 目录记 0。
     pub size: u64,
-    /// Unix 秒。目录没有 mtime，记为 0。
+    /// Unix 秒。目录也填真实 mtime（见 [`entry`]）。
     pub mtime: u64,
 }
 
@@ -35,12 +39,15 @@ pub fn list_dir(basket: &Basket, dir: &str) -> Result<Vec<Entry>> {
     if dir.is_empty() {
         // 篮子根：cherry 本身。
         for cherry in &basket.cherries {
-            out.push(entry(&cherry.name, &cherry.source)?);
+            // 这里不会是 `None`：`Basket::add` 已经把源路径规范化过，符号链接在那一步
+            // 就解析掉了。真出现就说明 `baskets.json` 被人手改了。
+            match entry(&cherry.name, &cherry.source)? {
+                Some(e) => out.push(e),
+                None => tracing::warn!(cherry = %cherry.name, "源不是普通文件也不是真目录，跳过"),
+            }
         }
     } else {
-        let full = resolve(basket, dir)?;
-        let meta = std::fs::metadata(&full)
-            .with_context(|| format!("stat {} 失败", full.display()))?;
+        let (full, meta) = resolve(basket, dir)?;
         if !meta.is_dir() {
             bail!("`{dir}` 不是一个目录");
         }
@@ -55,17 +62,43 @@ pub fn list_dir(basket: &Basket, dir: &str) -> Result<Vec<Entry>> {
                     continue;
                 }
             };
-            out.push(entry(&name, &de.path())?);
+            match entry(&name, &de.path())? {
+                Some(e) => out.push(e),
+                None => tracing::warn!(path = %de.path().display(), "符号链接之类，不共享"),
+            }
         }
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
 }
 
+/// 这个元数据指向的东西能不能对外。
+///
+/// **共享的只有真文件和真目录。** 符号链接不共享：一个指向共享树外面的链接等于绕开了
+/// `..` 的封锁。设备和 fifo 之类也不共享——共享出去的是文件，不是那台机器的延伸。
+///
+/// 注意要用 `symlink_metadata` 拿元数据，`metadata` 会跟随链接、看不出它是链接。
+pub fn servable(meta: &std::fs::Metadata) -> Option<CherryKind> {
+    if meta.is_symlink() {
+        return None;
+    }
+    if meta.is_dir() {
+        Some(CherryKind::Dir)
+    } else if meta.is_file() {
+        Some(CherryKind::File)
+    } else {
+        None
+    }
+}
+
 /// 把篮子内的相对路径解析回创建者磁盘上的绝对路径。
 ///
-/// 这是安全边界：`..` 和绝对路径都不允许，否则查看者能读到 cherry 之外的东西。
-pub fn resolve(basket: &Basket, path: &str) -> Result<PathBuf> {
+/// 这是安全边界：`..`、绝对路径、以及**任何一段是符号链接**都不允许，否则查看者
+/// 能读到 cherry 之外的东西。
+///
+/// 顺手把元数据带回来，并且在这里就把「能不能对外」判掉：调用方要判存在、判类型、
+/// 要 size/mtime，全由这一次 stat 给出，别再各自 stat 一遍然后说法不一。
+pub fn resolve(basket: &Basket, path: &str) -> Result<(PathBuf, std::fs::Metadata)> {
     let mut it = path.split('/');
     let root = it.next().unwrap_or_default();
     // 空串（含前导 `/`）、`.`、`..` 都先拦下：它们本来也找不到 cherry，
@@ -91,24 +124,51 @@ pub fn resolve(basket: &Basket, path: &str) -> Result<PathBuf> {
         }
         full.push(seg);
     }
-    Ok(full)
+
+    // 段里没有 `..` 不等于爬不出去：中间任何一段都可以是符号链接。
+    //
+    // 判法是「把解析后的真实路径的尾段，和请求的尾段逐段比」。只要中间跟过任何
+    // 一个符号链接，两者就不一样，直接拒——这也正是「不共享符号链接」这条规则本身。
+    // 只 canonicalize 一次（cherry 的源在 `Basket::add` 里已经规范化过）。
+    //
+    // macOS 上 `realpath` 保留传入的大小写，所以同一段名字换大小写不会被误拒。
+    let real = full
+        .canonicalize()
+        .with_context(|| format!("读不到 {}", full.display()))?;
+    let asked = full.strip_prefix(&cherry.source).unwrap_or(Path::new(""));
+    let got = real
+        .strip_prefix(&cherry.source)
+        .with_context(|| format!("`{path}` 指到了共享范围外面"))?;
+    if got != asked {
+        bail!("`{path}` 中间有符号链接，不共享");
+    }
+
+    let meta = std::fs::symlink_metadata(&full)
+        .with_context(|| format!("stat {} 失败", full.display()))?;
+    servable(&meta).with_context(|| format!("`{path}` 不是普通文件也不是真目录，不共享"))?;
+    Ok((full, meta))
 }
 
-fn entry(name: &str, full: &std::path::Path) -> Result<Entry> {
-    let meta = std::fs::metadata(full).with_context(|| format!("stat {} 失败", full.display()))?;
-    Ok(Entry {
+/// `None` 表示这个条目不共享（符号链接、设备之类），调用方跳过它并说一声。
+fn entry(name: &str, full: &std::path::Path) -> Result<Option<Entry>> {
+    // 必须用 `symlink_metadata`：`metadata` 会跟随链接，就看不出它是链接了。
+    let meta = std::fs::symlink_metadata(full)
+        .with_context(|| format!("stat {} 失败", full.display()))?;
+    let Some(kind) = servable(&meta) else {
+        return Ok(None);
+    };
+    let is_dir = matches!(kind, CherryKind::Dir);
+    Ok(Some(Entry {
         name: name.to_owned(),
-        kind: if meta.is_dir() {
-            CherryKind::Dir
-        } else {
-            CherryKind::File
-        },
-        size: if meta.is_dir() { 0 } else { meta.len() },
+        kind,
+        size: if is_dir { 0 } else { meta.len() },
+        // 目录也有 mtime，而且**必须填真的**：NFS 客户端靠它判断目录列表要不要重取，
+        // 填 0 就等于「永远不刷新」。
         mtime: mtime_of(&meta),
-    })
+    }))
 }
 
-pub(crate) fn mtime_of(meta: &std::fs::Metadata) -> u64 {
+pub fn mtime_of(meta: &std::fs::Metadata) -> u64 {
     meta.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -180,5 +240,58 @@ mod tests {
         let (b, _d) = tree("notdir");
         let root = b.cherries[0].name.clone();
         assert!(list_dir(&b, &format!("{root}/ok.txt")).is_err());
+    }
+
+    /// 跟随链接的 `metadata` 看不出它是链接——这就是必须用 `symlink_metadata` 的原因。
+    #[cfg(unix)]
+    #[test]
+    fn 只有真文件和真目录能对外() {
+        let d = std::env::temp_dir().join(format!("cherry-servable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("f");
+        std::fs::write(&f, b"x").unwrap();
+        let l = d.join("l");
+        std::os::unix::fs::symlink(&f, &l).unwrap();
+
+        let meta = |p: &std::path::Path| std::fs::symlink_metadata(p).unwrap();
+        assert_eq!(servable(&meta(&d)), Some(CherryKind::Dir));
+        assert_eq!(servable(&meta(&f)), Some(CherryKind::File));
+        assert_eq!(servable(&meta(&l)), None, "符号链接不共享");
+        assert_eq!(
+            servable(&std::fs::metadata(&l).unwrap()),
+            Some(CherryKind::File),
+            "跟随链接的话就看不出它是链接了"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 符号链接不共享，也不许从它中间穿过：指到外面等于绕开 `..` 的封锁，指到里面
+    /// 也不是一个真文件。两者都得拒。
+    #[cfg(unix)]
+    #[test]
+    fn 符号链接既不共享也不许穿过() {
+        let (b, dir) = tree("symlink");
+        let root = b.cherries[0].name.clone();
+        let outside = std::env::temp_dir().join(format!("cherry-outside-{}", std::process::id()));
+        std::fs::write(&outside, b"secret").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("escape")).unwrap();
+        std::os::unix::fs::symlink(dir.join("ok.txt"), dir.join("inside")).unwrap();
+
+        // 指到外面的：规范化之后不在 cherry 里面了。
+        let e = resolve(&b, &format!("{root}/escape")).unwrap_err();
+        assert!(e.to_string().contains("共享范围外面"), "报错要说清爬出去了: {e}");
+        // 指到里面的：落在范围内，但请求的那段和磁盘上那段不是一个名字。
+        let e = resolve(&b, &format!("{root}/inside")).unwrap_err();
+        assert!(e.to_string().contains("符号链接"), "报错要说清是链接: {e}");
+
+        let names: Vec<_> = list_dir(&b, &root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(!names.contains(&"escape".to_owned()), "列目录不该出现: {names:?}");
+        assert!(!names.contains(&"inside".to_owned()), "列目录不该出现: {names:?}");
+        let _ = std::fs::remove_file(&outside);
     }
 }

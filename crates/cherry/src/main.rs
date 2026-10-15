@@ -1,14 +1,14 @@
 //! cherry —— CherryShare 的命令行界面。
 //!
-//! 是完整的操作界面，不是给脚本用的子集：Unix 上没有 GUI，全部操作都得靠它。
-//! 但它和 GUI 是兄弟不是父子：两个都只是 local socket 上的控制组消费者，
-//! 语义判断一律不在这儿做（ADR-0003、ADR-0004）。
+//! 是**完整的**操作界面，不是给脚本用的子集：v1 没有 GUI（ADR-0004），全部操作都靠它。
+//! 它只是 local socket 上的一个消费者，语义判断一律不在这儿做（ADR-0003）。
 
 use std::path::PathBuf;
 
-use anyhow::Result;
-use cherry_control::{CherryView, Client, Event, Request, Response};
-use cherry_core::CherryKind;
+use anyhow::{Context, Result, bail};
+use cherry_control::{CherryView, Client, Request, Response};
+use cherry_core::link::NFS_PORT;
+use cherry_core::BasketLink;
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -51,66 +51,39 @@ enum Cmd {
         /// cherry 名
         name: String,
     },
-    /// 打出分享链接
+    /// 打出分享链接（连同对方要用的挂载命令）
     Link {
         /// 篮子名
         basket: String,
+        /// 链接里填哪个地址。不给就问内核要（多网卡 / 有 VPN 时可能要显式给）
+        #[arg(long)]
+        host: Option<String>,
     },
-    /// 列对方篮子里**一个目录**（ADR-0006：listing 的单位是一个目录，不是整棵树）
-    Ls {
+    /// 挂上对方分享的篮子。不需要本机跑服务
+    Mount {
         /// BasketLink
         link: String,
-        /// 篮子内的相对路径。不给就是篮子根。
-        path: Option<String>,
-    },
-    /// 读对方一个文件的一段字节（默认从开头读 64 KiB）
-    Cat {
-        /// BasketLink
-        link: String,
-        /// 篮子内的相对路径
-        path: String,
-        /// 从哪个字节开始
-        #[arg(long, default_value_t = 0)]
-        start: u64,
-        /// 读多少字节
-        #[arg(long, default_value_t = 64 * 1024)]
-        len: u64,
-    },
-    /// 从别人的篮子里挑一个文件下来
-    Pick {
-        /// BasketLink
-        link: String,
-        /// 篮子内的路径，从 open 的输出里抄
-        path: String,
-        /// 存到哪儿
-        dest: PathBuf,
+        /// 挂到哪儿。不给就是 ~/cherry/<id 前 8 位>
+        mountpoint: Option<PathBuf>,
     },
 }
 
-// 这个 CLI 是个瘦客户端：真正的传输在 cherryd 里，这里只发请求、读进度。
-// 所以不需要 cherryd 那个压 worker 数的处理（见 crates/cherryd 的 runtime()）。
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // 挂载是纯客户端动作：对方的系统自带 NFS 客户端，本机不需要服务。
+    if let Cmd::Mount { link, mountpoint } = cli.cmd {
+        return mount(&link, mountpoint);
+    }
+
     let data_dir = match cli.data_dir {
         Some(d) => d,
         None => cherry_core::service::default_data_dir()?,
     };
-
     let mut client = Client::connect(&data_dir).await?;
-    let req = to_request(cli.cmd);
-
-    let resp = client
-        .call(&req, |ev| {
-            match ev {
-                Event::Info(s) => println!("  {s}"),
-                Event::Bytes { done, total } => print_progress(done, total),
-            };
-        })
-        .await?;
-
-    match resp {
-        Response::Error(e) => anyhow::bail!("{e}"),
+    match client.call(&to_request(cli.cmd)).await? {
+        Response::Error(e) => bail!("{e}"),
         other => print(other),
     }
     Ok(())
@@ -124,37 +97,63 @@ fn to_request(cmd: Cmd) -> Request {
         Cmd::Show { basket } => Request::ShowBasket { name: basket },
         Cmd::Add { basket, path } => Request::AddCherry { basket, path },
         Cmd::Rm { basket, name } => Request::RemoveCherry { basket, name },
-        Cmd::Link { basket } => Request::Link { basket },
-        Cmd::Ls { link, path } => Request::Ls {
-            link,
-            dir: path.unwrap_or_default(),
-        },
-        Cmd::Cat {
-            link,
-            path,
-            start,
-            len,
-        } => Request::Cat {
-            link,
-            path,
-            start,
-            len,
-        },
-        Cmd::Pick { link, path, dest } => Request::Fetch { link, path, dest },
+        Cmd::Link { basket, host } => Request::Link { basket, host },
+        // main 里提前返回了。
+        Cmd::Mount { .. } => unreachable!(),
     }
+}
+
+/// 把对方的篮子挂到本机。命令行就是链接里那些参数拼出来的（ADR-0002）。
+fn mount(link: &str, mountpoint: Option<PathBuf>) -> Result<()> {
+    let link: BasketLink = link.parse().context("链接看不懂")?;
+    let mnt = match mountpoint {
+        Some(p) => p,
+        None => dirs::home_dir()
+            .context("找不到 home 目录")?
+            .join("cherry")
+            .join(&link.basket_id_hex()[..8]),
+    };
+    std::fs::create_dir_all(&mnt)
+        .with_context(|| format!("建不出挂载点 {}", mnt.display()))?;
+
+    let port = NFS_PORT.to_string();
+    let opts = format!("nolocks,vers=3,tcp,port={port},mountport={port},soft,actimeo=5");
+    let out = std::process::Command::new("mount_nfs")
+        .arg("-o")
+        .arg(&opts)
+        .arg(link.mount_source())
+        .arg(&mnt)
+        .output()
+        .context("跑不起 mount_nfs")?;
+    if !out.status.success() {
+        // "不允许静默失败"：把 mount_nfs 的原话带出来。
+        bail!(
+            "挂载失败：{}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+
+    println!("挂上了：{}", mnt.display());
+    println!("（只读。想卸掉：`umount {}`）", mnt.display());
+    Ok(())
 }
 
 fn print(resp: Response) {
     match resp {
-        Response::Done | Response::Error(_) => {}
+        Response::Error(_) => {}
         Response::Status {
-            endpoint,
             baskets,
             data_dir,
+            nfs_port,
+            nfs_up,
         } => {
-            println!("endpoint   {endpoint}");
-            println!("baskets    {baskets}");
             println!("data       {}", data_dir.display());
+            println!("baskets    {baskets}");
+            // 监听没起来就说出来，别让人以为分享是好的。
+            println!(
+                "nfs        {nfs_port}  {}",
+                if nfs_up { "" } else { "（没起来：局域网挂载这条路不可用）" }
+            );
         }
         Response::Baskets(list) => {
             if list.is_empty() {
@@ -176,62 +175,30 @@ fn print(resp: Response) {
         Response::Link(l) => {
             println!("{l}");
             println!();
-            println!("把这条发给对方。它带完整的 endpoint 地址，所以同网段直连就行，");
-            println!("不需要 relay 或 DNS。");
-        }
-        Response::Listing(entries) => {
-            if entries.is_empty() {
-                println!("（这个目录是空的）");
-            }
-            for e in entries {
-                // 目录不给大小。它自己就是 0，而显示「0 B」是假的。
-                match e.kind {
-                    CherryKind::Dir => println!("{:>9}  {}/", "-", e.name),
-                    CherryKind::File => println!("{:>9}  {}", human_size(e.size), e.name),
+            println!("把这条发给对方。");
+            if let Ok(link) = l.parse::<BasketLink>() {
+                let mnt = format!("~/cherry/{}", &link.basket_id_hex()[..8]);
+                println!();
+                println!("他装了 cherry：");
+                println!("  cherry mount {l}");
+                println!();
+                println!("他没装，就在同一个局域网，粘这两行：");
+                println!("  {}", link.mount_command(&mnt));
+                println!("  umount {mnt}");
+
+                // 自动挑的那个未必是对方能到的（有 VPN、有虚拟机网桥的时候），
+                // 所以把其余候选也印出来。
+                if let Ok(addrs) = cherry_core::link::lan_addrs()
+                    && !addrs.others.is_empty()
+                {
+                    let list: Vec<String> = addrs.others.iter().map(|a| a.to_string()).collect();
+                    println!(
+                        "  （挑的是 {}。对方挂不上就换这几个试：{}）",
+                        link.host,
+                        list.join("  ")
+                    );
                 }
             }
-            println!();
-            println!("进子目录：`cherry ls <链接> <路径>`");
-            println!("取文件：  `cherry pick <链接> <路径> <存到哪>`");
         }
-        Response::Fetched(f) => {
-            println!(
-                "下好了：{} → {}",
-                human_size(f.bytes),
-                f.path.display()
-            );
-        }
-        Response::Bytes(bytes) => {
-            use std::io::Write;
-            // 管道断掉（`| head`）是正常的，不当错误。
-            let _ = std::io::stdout().write_all(&bytes);
-            let _ = std::io::stdout().flush();
-        }
-    }
-}
-
-/// 进度只往 stderr 之外的一行刷，不滚屏。
-fn print_progress(done: u64, total: Option<u64>) {
-    match total {
-        Some(t) if t > 0 => eprint!("\r  {} / {}  ", human_size(done), human_size(t)),
-        _ => eprint!("\r  {}  ", human_size(done)),
-    }
-    if done == total.unwrap_or(done) {
-        eprintln!();
-    }
-}
-
-fn human_size(n: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut v = n as f64;
-    let mut i = 0;
-    while v >= 1024.0 && i < UNITS.len() - 1 {
-        v /= 1024.0;
-        i += 1;
-    }
-    if i == 0 {
-        format!("{n} B")
-    } else {
-        format!("{v:.1} {}", UNITS[i])
     }
 }

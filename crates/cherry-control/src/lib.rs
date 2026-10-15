@@ -1,22 +1,28 @@
-//! local socket 上的控制组消息（GUI / CLI）。见 ADR-0003。
+//! local socket 上的控制组消息。见 ADR-0003。
 //!
-//! 这一层只搬字节：请求、事件、响应。所有语义判断都在 `cherry-core` 的
-//! `Service` 里做一次，这里不重复。
+//! 这一层只搬字节：请求和响应。所有语义判断都在 `cherry-core` 的 `Service` 里做一次，
+//! 这里不重复。
 //!
-//! socket 权限 0600，内核强制只有同用户能连，所以不需要 token；没有端口，
+//! **这一层是"我们的"唯一的线上协议**（帧格式 + 这两个 enum）。别的传输都是内核的事：
+//! NFS 那条路由系统自带的客户端讲（ADR-0007）。
+//!
+//! socket 权限 0600，内核强制只有同用户能连，所以不需要 token；客户端这一侧没有端口，
 //! 也就没有网络攻击面。
 
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
-use cherry_core::{
-    Entry, Fetched, Notice, Service,
-    proto::{read_frame, write_frame},
-};
-use serde::{Deserialize, Serialize};
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
+use cherry_core::Service;
+
 const SOCKET_FILE: &str = "cherryd.sock";
+
+/// 一帧最大 16 MiB。篮子够大，但不该无限大。
+const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
 pub fn socket_path(data_dir: &Path) -> PathBuf {
     data_dir.join(SOCKET_FILE)
@@ -40,54 +46,25 @@ pub enum Request {
         basket: String,
         name: String,
     },
-    /// 打出本机某个 basket 的分享链接。
+    /// 打出本机某个 basket 的分享链接。`host` 不给就问内核要（见 ADR-0002）。
     Link {
         basket: String,
+        host: Option<String>,
     },
-    /// 列对方篮子里**一个目录**。空串表示篮子根（ADR-0006：listing 的单位是一个目录）
-    Ls {
-        link: String,
-        /// 篮子内的相对路径，空串表示篮子根。
-        dir: String,
-    },
-    /// 读对方某一个文件的一段字节（ADR-0006 的 `Read`）。
-    Cat {
-        link: String,
-        path: String,
-        /// 从哪开始。
-        start: u64,
-        /// 读多少。
-        len: u64,
-    },
-    /// 从别人的篮子里取一个文件。
-    Fetch {
-        link: String,
-        path: String,
-        dest: PathBuf,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Event {
-    Info(String),
-    Bytes { done: u64, total: Option<u64> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
-    Done,
     Status {
-        endpoint: String,
         baskets: usize,
         data_dir: PathBuf,
+        /// NFS 导出的端口。`nfs_up` 为假说明那个监听没起来（端口被占之类）。
+        nfs_port: u16,
+        nfs_up: bool,
     },
     Baskets(Vec<BasketView>),
     Basket(BasketView),
     Link(String),
-    Listing(Vec<Entry>),
-    /// 一段原始字节。帧上限 16 MiB（见 `proto::MAX_FRAME`）。
-    Bytes(Vec<u8>),
-    Fetched(Fetched),
     Error(String),
 }
 
@@ -105,11 +82,37 @@ pub struct CherryView {
     pub source: String,
 }
 
-/// 服务端→客户端：先若干条事件，最后一条 Done。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum ServerMsg {
-    Event(Event),
-    Done(Response),
+// ---- 帧：长度前缀 + postcard ----
+
+async fn write_frame<W, T>(w: &mut W, msg: &T) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+    T: Serialize,
+{
+    let bytes = postcard::to_stdvec(msg).context("序列化失败")?;
+    w.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
+    w.write_all(&bytes).await?;
+    w.flush().await?;
+    Ok(())
+}
+
+/// 对端干净关闭时返回 `None`。
+async fn read_frame<R, T>(r: &mut R) -> Result<Option<T>>
+where
+    R: AsyncRead + Unpin,
+    T: DeserializeOwned,
+{
+    let len = match r.read_u32().await {
+        Ok(n) => n,
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e).context("读帧长度失败"),
+    };
+    if len > MAX_FRAME {
+        bail!("帧太大：{len} 字节");
+    }
+    let mut buf = vec![0u8; len as usize];
+    r.read_exact(&mut buf).await.context("读帧内容失败")?;
+    Ok(Some(postcard::from_bytes(&buf).context("反序列化失败")?))
 }
 
 // ---- 客户端 ----
@@ -130,22 +133,11 @@ impl Client {
         Ok(Self { stream })
     }
 
-    /// 发一个请求，边收事件边等最终响应。
-    pub async fn call(
-        &mut self,
-        req: &Request,
-        mut on_event: impl FnMut(Event),
-    ) -> Result<Response> {
+    pub async fn call(&mut self, req: &Request) -> Result<Response> {
         write_frame(&mut self.stream, req).await?;
-        loop {
-            let msg: ServerMsg = read_frame(&mut self.stream)
-                .await?
-                .context("cherryd 没说为什么就断了")?;
-            match msg {
-                ServerMsg::Event(e) => on_event(e),
-                ServerMsg::Done(r) => return Ok(r),
-            }
-        }
+        read_frame::<_, Response>(&mut self.stream)
+            .await?
+            .context("cherryd 没说为什么就断了")
     }
 }
 
@@ -166,57 +158,28 @@ pub async fn serve(listener: UnixListener, svc: Service) -> Result<()> {
 async fn handle_conn(stream: UnixStream, svc: Service) -> Result<()> {
     let (mut rd, mut wr) = stream.into_split();
     while let Some(req) = read_frame::<_, Request>(&mut rd).await? {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
-        let mut emit = move |n: Notice| {
-            let e = match n {
-                Notice::Info(s) => Event::Info(s),
-                Notice::Bytes { done, total } => Event::Bytes { done, total },
-            };
-            // 接收端没了也不影响操作本身。
-            let _ = tx.send(e);
-        };
-
-        let fut = dispatch(&svc, &req, &mut emit);
-        tokio::pin!(fut);
-
-        // 操作在跑的同时把事件推出去，而不是憋到最后一起发。
-        let resp = loop {
-            tokio::select! {
-                res = &mut fut => break res,
-                Some(ev) = rx.recv() => write_frame(&mut wr, &ServerMsg::Event(ev)).await?,
-            }
-        };
-        write_frame(&mut wr, &ServerMsg::Done(resp)).await?;
+        let resp = dispatch(&svc, &req).await;
+        write_frame(&mut wr, &resp).await?;
     }
     Ok(())
 }
 
-async fn dispatch(
-    svc: &Service,
-    req: &Request,
-    emit: &mut (dyn FnMut(Notice) + Send),
-) -> Response {
-    match dispatch_inner(svc, req, emit).await {
+async fn dispatch(svc: &Service, req: &Request) -> Response {
+    match dispatch_inner(svc, req).await {
         Ok(r) => r,
         // 失败一定要说清楚，不能静默。
         Err(e) => Response::Error(format!("{e:#}")),
     }
 }
 
-async fn dispatch_inner(
-    svc: &Service,
-    req: &Request,
-    emit: &mut (dyn FnMut(Notice) + Send),
-) -> Result<Response> {
+async fn dispatch_inner(svc: &Service, req: &Request) -> Result<Response> {
     match req {
-        Request::Status => {
-            let baskets = svc.list_baskets().await;
-            Ok(Response::Status {
-                endpoint: svc.endpoint().id().to_string(),
-                baskets: baskets.len(),
-                data_dir: svc.data_dir().to_path_buf(),
-            })
-        }
+        Request::Status => Ok(Response::Status {
+            baskets: svc.list_baskets().await.len(),
+            data_dir: svc.data_dir().to_path_buf(),
+            nfs_port: cherry_core::link::NFS_PORT,
+            nfs_up: svc.nfs_up(),
+        }),
         Request::ListBaskets => Ok(Response::Baskets(
             svc.list_baskets().await.iter().map(view).collect(),
         )),
@@ -233,31 +196,12 @@ async fn dispatch_inner(
             svc.remove_cherry(basket, name).await?;
             Ok(Response::Basket(view(&svc.basket(basket).await?)))
         }
-        Request::Link { basket } => Ok(Response::Link(svc.link(basket).await?.to_string())),
-        Request::Ls { link, dir } => {
-            let link: cherry_core::BasketLink = link.parse().context("链接解析失败")?;
-            Ok(Response::Listing(svc.list_dir(&link, dir).await?))
-        }
-        Request::Cat {
-            link,
-            path,
-            start,
-            len,
-        } => {
-            let link: cherry_core::BasketLink = link.parse().context("链接解析失败")?;
-            // 回应是一帧，而帧上限是 16 MiB。这是**我们的**协议限制，所以在 core/control
-            // 这一层判，不让客户端各自去判（ADR-0003）。
-            const CAP: u64 = 8 * 1024 * 1024;
-            anyhow::ensure!(*len <= CAP, "一次最多读 {CAP} 字节（IPC 帧上限 16 MiB）");
-            // 先 Open（路径 → hash），再按范围读。
-            let (hash, size) = svc.open_file(&link, path).await?;
-            Ok(Response::Bytes(
-                svc.read_range(&link, hash, size, *start, *len).await?,
-            ))
-        }
-        Request::Fetch { link, path, dest } => {
-            let link: cherry_core::BasketLink = link.parse().context("链接解析失败")?;
-            Ok(Response::Fetched(svc.fetch(&link, path, dest, emit).await?))
+        Request::Link { basket, host } => {
+            let host: Option<IpAddr> = match host {
+                Some(h) => Some(h.parse().with_context(|| format!("`{h}` 不是合法地址"))?),
+                None => None,
+            };
+            Ok(Response::Link(svc.link(basket, host).await?.to_string()))
         }
     }
 }
@@ -278,5 +222,35 @@ fn view(b: &cherry_core::Basket) -> BasketView {
                 source: c.source.display().to_string(),
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn 帧往返() {
+        let mut buf = Vec::new();
+        write_frame(
+            &mut buf,
+            &Request::AddCherry {
+                basket: "b".into(),
+                path: "a/b.txt".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut cur = std::io::Cursor::new(buf);
+        let got: Request = read_frame(&mut cur).await.unwrap().unwrap();
+        assert!(matches!(got, Request::AddCherry { .. }));
+    }
+
+    #[tokio::test]
+    async fn 读到结尾返回_none() {
+        let mut cur = std::io::Cursor::new(Vec::new());
+        let got: Option<Request> = read_frame(&mut cur).await.unwrap();
+        assert!(got.is_none());
     }
 }

@@ -23,31 +23,23 @@ rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-# 传输层，见 ADR-0001 / ADR-0002。
-# iroh-blobs 必须 >= 0.103.1：0.94~0.103.0 有请求掩码安全修复，push 一类请求
-# 可能被意外放行。我们也不启用 push。
-iroh = "1.3"
-iroh-blobs = "0.103.1"
-iroh-tickets = "1.0"
-# mDNS 在 iroh 1.3 里已经拆出主 crate。ADR-0002 要求显式开它。
-iroh-mdns-address-lookup = "0.6"
-# iroh 1.3 用的就是 noq-proto 1.3，版本必须对齐，否则 ControllerFactory
-# 不是同一个 trait。默认拥塞控制器（Cubic）见 endpoint.rs 里的说明。
-noq-proto = "1.3.0"
-
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-postcard = "1"
+postcard = { version = "1", features = ["use-std"] }
 anyhow = "1"
-thiserror = "2"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+libc = "0.2"
 dirs = "6"
 hex = "0.4"
 getrandom = "0.2"
-futures-lite = "2"
+
+# 把篮子当只读 NFS 导出的服务端。用它是因为对方系统自带 NFS 客户端，
+# 不用装东西也不用我们写 FUSE。纯用户态，不碰内核。见 ADR-0007。
+nfsserve = "0.11"
+async-trait = "0.1"
 
 cherry-core = { path = "crates/cherry-core" }
 cherry-control = { path = "crates/cherry-control" }

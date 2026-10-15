@@ -1,55 +1,24 @@
 //! 服务：所有语义判断的唯一落点。见 ADR-0003。
 //!
 //! 客户端只收集输入、呈现输出。合法性、路径规范化、冲突、状态机在这里做一次。
+//!
+//! **服务的全部持久状态就是 basket 配置。** 没有 identity key、没有 blobs store、
+//! 没有索引缓存——ADR-0007 决策六把它们一起删了。字节也不经过这里：创建者的服务把
+//! basket 讲成只读 NFS（见 `cherryd` 的 `nfs`），对方的**内核**直接读这台机器的磁盘。
 
 use std::{
+    net::IpAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use anyhow::{Context, Result, bail};
-use iroh::{Endpoint, protocol::Router};
-use iroh_blobs::{
-    BlobsProtocol, Hash,
-    api::{Store, remote::GetProgressItem},
-    protocol::{ChunkRanges, ChunkRangesExt, GetRequest},
-    store::fs::FsStore,
-};
-use futures_lite::StreamExt;
 use tokio::sync::RwLock;
 
-use crate::{
-    basket::Basket,
-    endpoint,
-    index::Index,
-    link::BasketLink,
-    listing::Entry,
-    proto::{ALPN, WireRequest, WireResponse, read_frame, write_frame},
-    provider::Provider,
-};
-
-/// 取数单位（ADR-0006 决策五）。
-///
-/// 校验粒度是 BLAKE3 chunk = 1KB（协议定死），但**一次要多少**是我们的策略：一条 1KB 的
-/// range 请求等于一次网络往返。1MB 的依据是 LAN 上 RTT ~1ms，1MB 大约十到几十毫秒取完。
-const BLOCK: u64 = 1024 * 1024;
-
-/// 进度通知。客户端把它变成自己要显示的东西；core 不认识「UI」。
-#[derive(Debug, Clone)]
-pub enum Notice {
-    Info(String),
-    /// `done` 是**本次请求**读到的字节数，不是累计进度。
-    /// 所以断点续传时它会从 0 重新开始，不是从已经有的那部分接着数——
-    /// 界面若直接拿它当「已完成 x/y」会误导。待修。
-    Bytes { done: u64, total: Option<u64> },
-}
-
-/// 下载结果。
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct Fetched {
-    pub path: PathBuf,
-    pub bytes: u64,
-}
+use crate::{basket::Basket, link::BasketLink};
 
 #[derive(Clone)]
 pub struct Service {
@@ -58,18 +27,15 @@ pub struct Service {
 
 struct Inner {
     data_dir: PathBuf,
-    endpoint: Endpoint,
-    store: Store,
     /// 唯一的持久状态里，这份是「设计选择」而不是「OS 强制」（ADR-0003）。
     baskets: RwLock<Vec<Basket>>,
-    /// 索引缓存（ADR-0002 要求）。也是「设计选择」那一类：坏了只丢缓存，不丢数据。
-    index: RwLock<Index>,
+    /// NFS 导出那个监听起来了没有。`cherryd` 绑好（或绑失败）之后告诉服务。
+    nfs_up: AtomicBool,
 }
 
 impl std::fmt::Debug for Service {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Service")
-            .field("endpoint", &self.inner.endpoint.id())
             .field("data_dir", &self.inner.data_dir)
             .field("baskets", &self.inner.baskets)
             .finish_non_exhaustive()
@@ -77,70 +43,35 @@ impl std::fmt::Debug for Service {
 }
 
 impl Service {
-    /// 起服务：拿 identity key、开 blobs store、读 basket 配置。
+    /// 起服务：建数据目录、读 basket 配置。
     pub async fn start(data_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&data_dir)
             .with_context(|| format!("建不出数据目录 {}", data_dir.display()))?;
-
-        let secret = load_or_create_identity(&data_dir)?;
-        let ep = endpoint::bind(secret).await?;
-
-        let blobs_dir = data_dir.join("blobs");
-        std::fs::create_dir_all(&blobs_dir)?;
-        // redb 排他锁在这里：同一台机器上只能有一个服务实例（ADR-0003）。
-        let fs = FsStore::load(&blobs_dir)
-            .await
-            .context("打开 blobs store 失败（是不是已经有 cherryd 在跑？）")?;
-        let store: Store = fs.into();
-
         let baskets = load_baskets(&data_dir)?;
-        // 缓存读不了不该让服务起不来——它只是缓存。
-        let index = Index::load(&data_dir).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "索引缓存读不了，当作空的");
-            Index::default()
-        });
-        tracing::info!(
-            endpoint = %ep.id(),
-            baskets = baskets.len(),
-            "cherryd 起来了"
-        );
-
+        tracing::info!(baskets = baskets.len(), "cherryd 起来了");
         Ok(Self {
             inner: Arc::new(Inner {
                 data_dir,
-                endpoint: ep,
-                store,
                 baskets: RwLock::new(baskets),
-                index: RwLock::new(index),
+                nfs_up: AtomicBool::new(false),
             }),
         })
-    }
-
-    pub fn endpoint(&self) -> &Endpoint {
-        &self.inner.endpoint
-    }
-
-    pub fn store(&self) -> &Store {
-        &self.inner.store
     }
 
     pub fn data_dir(&self) -> &Path {
         &self.inner.data_dir
     }
 
-    /// 我们的 ALPN + iroh-blobs 的原生 ALPN。
+    /// NFS 导出那个监听起来了没有。
     ///
-    /// 后者是必需的：`GetFile` 只回 hash，字节由查看者按 hash 自己取。
-    pub fn spawn_router(&self) -> Result<Router> {
-        let provider = Provider::new(self.clone());
-        let blobs = BlobsProtocol::new(&self.inner.store, None);
-        Ok(Router::builder(self.inner.endpoint.clone())
-            .accept(ALPN, provider)
-            .accept(iroh_blobs::ALPN, blobs)
-            .spawn())
+    /// 让 `cherry status` 不会在监听没起来的时候报「在跑」——那是静默失败的一种。
+    pub fn set_nfs_up(&self, up: bool) {
+        self.inner.nfs_up.store(up, Ordering::Relaxed);
     }
 
-    // ---- 创建者侧 ----
+    pub fn nfs_up(&self) -> bool {
+        self.inner.nfs_up.load(Ordering::Relaxed)
+    }
 
     pub async fn create_basket(&self, name: &str) -> Result<Basket> {
         let mut baskets = self.inner.baskets.write().await;
@@ -201,317 +132,20 @@ impl Service {
             .iter()
             .find(|b| &b.id == id)
             .cloned()
-            // 不泄漏「这个 id 存在但你没权限」这种区别。
+            // 不泄漏「这个 id 存在但你没权限」这种区别（ADR-0007 决策二）。
             .context("这个 basket 不在我这儿")
     }
 
-    /// 本机这个 basket 的链接。带当前 endpoint 地址。
-    pub async fn link(&self, basket: &str) -> Result<BasketLink> {
+    /// 本机这个 basket 的链接。`host` 不给就自己挑一个（见 [`crate::link::lan_addrs`]）。
+    ///
+    /// "填哪个地址"只有这里判一次，不让每个客户端各自判一遍（ADR-0003）。
+    pub async fn link(&self, basket: &str, host: Option<IpAddr>) -> Result<BasketLink> {
         let b = self.basket(basket).await?;
-        Ok(BasketLink::new(self.inner.endpoint.addr(), b.id))
-    }
-
-    // ---- 查看者侧 ----
-
-    /// 列对方篮子里**一个目录**。快：对面只做一次 `readdir` + 每个 entry 一次 `stat`。
-    pub async fn list_dir(&self, link: &BasketLink, dir: &str) -> Result<Vec<Entry>> {
-        let conn = self.connect(link).await?;
-        let (mut send, mut recv) = conn.open_bi().await.context("开流失败")?;
-        write_frame(
-            &mut send,
-            &WireRequest::ListDir {
-                basket_id: link.basket_id,
-                dir: dir.to_owned(),
-            },
-        )
-        .await?;
-        send.finish().context("关流失败")?;
-
-        match read_frame::<_, WireResponse>(&mut recv).await? {
-            Some(WireResponse::Listing { entries }) => Ok(entries),
-            Some(WireResponse::Error { message }) => bail!("创建者那边：{message}"),
-            Some(other) => bail!("意外的响应：{other:?}"),
-            None => bail!("创建者没回话就断了"),
-        }
-    }
-
-    /// 取一个文件：先问 hash（对面现算），再按 hash 走 iroh-blobs 取字节。
-    ///
-    /// **缺口：这次取字节的生存期挂在调用方这个 future 上。** GUI / CLI 是通过 local
-    /// socket 的请求处理任务调进来的，客户端一退出，任务被 drop，取到一半就断。
-    /// 实测（客户端退出后看 store 增长）只多活了半个进度步长 ≈ 5.7MB。
-    ///
-    /// 注意这**不是** ADR-0003 的承诺——那条说的是「Cmd+Q 不影响**别人下载**」，
-    /// 讲的是创建者一侧。ADR-0003 对数据一侧的要求在 mount 那节：**服务侧做块级
-    /// 缓存与预读、协议支持流式 range 读**（原话：「这不是优化」）。
-    ///
-    /// 所以正确的形状不是「把下载变成独立 job」——那是按文件切，而 mount 要的是按块、
-    /// 随机、可重复地读。应该是**服务侧一份块级缓存加一个填充它的取数循环**：
-    /// mount 从缓存里读，`pick` 变成「填满再拷出去」。填充循环在服务里，所以
-    /// 「取数不依赖客户端存活」是推论而不是特性。
-    pub async fn fetch(
-        &self,
-        link: &BasketLink,
-        path: &str,
-        dest: &Path,
-        notice: &mut (dyn FnMut(Notice) + Send),
-    ) -> Result<Fetched> {
-        notice(Notice::Info(format!("问创建者要 `{path}` 的 hash…")));
-
-        let (hash, size) = self.open_file(link, path).await?;
-        notice(Notice::Info(format!(
-            "创建者准备好了（{size} 字节），开始取字节…"
-        )));
-
-        self.download_blob(hash, link, size, notice).await?;
-
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        self.inner
-            .store
-            .blobs()
-            .export(hash, dest)
-            .await
-            .with_context(|| format!("导出到 {} 失败", dest.display()))?;
-
-        notice(Notice::Bytes {
-            done: size,
-            total: Some(size),
-        });
-        Ok(Fetched {
-            path: dest.to_path_buf(),
-            bytes: size,
-        })
-    }
-
-    /// 取一个文件的字节。
-    ///
-    /// 试过把一次下载切成 N 段、开 N 条独立连接并发取（`CHERRY_STREAMS`，已删）：**没用**。
-    /// N=1/2 都是 56 MB/s，N=4 降到 51，N=8 降到 43；两个客户端同时拉也一样（各剩一半，
-    /// 换成两个不同的 blob 也一样）。说明瓶颈是**每进程一个、所有连接共享的**东西，
-    /// 而不是某条连接的拥塞窗口。见 docs/performance.md。
-    async fn download_blob(
-        &self,
-        hash: Hash,
-        link: &BasketLink,
-        total: u64,
-        notice: &mut (dyn FnMut(Notice) + Send),
-    ) -> Result<()> {
-        // 关键：必须用 link 里那个带完整地址的 `EndpointAddr` 建连。
-        // 只给 endpoint id 的话，iroh-blobs 得自己去做地址发现，而我们把 relay
-        // 关了、mDNS 又未必找得到——于是就只能等超时。
-        let conn = self
-            .inner
-            .endpoint
-            .connect(link.addr.clone(), iroh_blobs::ALPN)
-            .await
-            .with_context(|| format!("连不上创建者的 blobs 服务 {}", link.addr.id))?;
-
-        let mut stream = self.inner.store.remote().fetch(conn, hash).stream();
-        // 每 2% 报一次：既不淹没界面，也不让人以为卡死了。
-        let step = (total / 50).max(1);
-        let mut next_report = 0u64;
-
-        while let Some(item) = stream.next().await {
-            match item {
-                GetProgressItem::Progress(done) => {
-                    if done >= next_report {
-                        notice(Notice::Bytes {
-                            done,
-                            total: Some(total),
-                        });
-                        next_report = done + step;
-                    }
-                }
-                GetProgressItem::Done(_) => break,
-                GetProgressItem::Error(e) => {
-                    bail!("从创建者取 {hash} 失败: {e}")
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn connect(&self, link: &BasketLink) -> Result<iroh::endpoint::Connection> {
-        self.inner
-            .endpoint
-            .connect(link.addr.clone(), ALPN)
-            .await
-            .with_context(|| format!("连不上创建者 {}", link.addr.id))
-    }
-
-    /// 把一个篮子内的路径换成 `(hash, size)`。ADR-0006 管这叫 `Open`。
-    ///
-    /// 昂贵的那一半在创建者那边，但现在有索引缓存接着（见 [`Self::hash_file`]）。
-    ///
-    /// **每次调用都新建一条 QUIC 连接**，而实测一次 `cat` 的固定开销是 ~10~20 ms
-    /// （其中 ~8 ms 是本地 socket 的往返）。CLI 一次一个请求无所谓，**但 mount 会被它
-    /// 卡死**——128 KiB 的读配 20 ms 的固定开销就是 ~10 MB/s。做 mount 时要把连接
-    /// 留下来复用，或者把 range 读做成一条长流。见 docs/mount.md。
-    pub async fn open_file(&self, link: &BasketLink, path: &str) -> Result<(Hash, u64)> {
-        let conn = self.connect(link).await?;
-        let (mut send, mut recv) = conn.open_bi().await.context("开流失败")?;
-        write_frame(
-            &mut send,
-            &WireRequest::GetFile {
-                basket_id: link.basket_id,
-                path: path.to_owned(),
-            },
-        )
-        .await?;
-        send.finish().context("关流失败")?;
-
-        match read_frame::<_, WireResponse>(&mut recv).await? {
-            Some(WireResponse::File { hash, size }) => Ok((hash, size)),
-            Some(WireResponse::Error { message }) => bail!("创建者那边：{message}"),
-            Some(other) => bail!("意外的响应：{other:?}"),
-            None => bail!("创建者没回话就断了"),
-        }
-    }
-
-    // ---- 按范围读：mount 的数据路径（ADR-0006）----
-
-    /// 让 store 拥有 `[start, end)` 这段字节，**缺哪块取哪块**。
-    ///
-    /// 这个填充循环不用我们自己写：`local_for_request` 问出「这段里已经有哪些」，
-    /// `missing()` 给出「还缺什么」（顺带就是断点续传），`execute_get` 把缺的取回来。
-    async fn ensure_range(
-        &self,
-        link: &BasketLink,
-        hash: Hash,
-        start: u64,
-        end: u64,
-    ) -> Result<()> {
-        let req = GetRequest::builder()
-            .root(ChunkRanges::bytes(start..end))
-            .build(hash);
-        let local = self
-            .inner
-            .store
-            .remote()
-            .local_for_request(req)
-            .await
-            .with_context(|| format!("问 store 要 {hash} 的 [{start},{end}) 失败"))?;
-        if local.is_complete() {
-            return Ok(());
-        }
-
-        let conn = self
-            .inner
-            .endpoint
-            .connect(link.addr.clone(), iroh_blobs::ALPN)
-            .await
-            .with_context(|| format!("连不上创建者的 blobs 服务 {}", link.addr.id))?;
-        let mut stream = self
-            .inner
-            .store
-            .remote()
-            .execute_get(conn, local.missing())
-            .stream();
-        while let Some(item) = stream.next().await {
-            match item {
-                GetProgressItem::Progress(_) => {}
-                GetProgressItem::Done(_) => return Ok(()),
-                GetProgressItem::Error(e) => {
-                    bail!("取 {hash} 的 [{start},{end}) 失败: {e}")
-                }
-            }
-        }
-        bail!("取 {hash} 的 [{start},{end}) 中途断了")
-    }
-
-    /// 读一段字节。未命中就先填，填的时候**顺手多取一块**（ADR-0006 决策五的预读）。
-    ///
-    /// **未实现：自适应预读窗口。** ADR-0006 决策五说的是「连续命中后窗口翻倍」，
-    /// 现在是一个固定的 +1 块。后果是小块读会超取——一个 128 KiB 的 mount 读会
-    /// 取回 2 MiB（对齐的 1 MiB 加预读的 1 MiB）。局域网里不贵，但等真正做 mount
-    /// 时该按顺序访问检测把它调小（或把 [`BLOCK`] 调小）。见 docs/mount.md。
-    ///
-    /// 取数单位是 [`BLOCK`]，不是 1KB：一条 1KB 的 range 请求等于一次网络往返。
-    ///
-    /// **从 store 读不用 `BlobReader`。** 那个 API 看上去最自然（`AsyncRead` + `AsyncSeek`），
-    /// 实测却大约 **2 MB/s**（1 KiB 一次 store RPC，而且每次都从头走一遍 bao 树）。
-    /// 换成 `export_ranges(..).concatenate()` 就是一次遍历：4 MiB 从 1.9 秒降到毫秒级
-    /// （这也是 docs/performance.md 里那个「导出 547 MB/s」）。
-    pub async fn read_range(
-        &self,
-        link: &BasketLink,
-        hash: Hash,
-        size: u64,
-        offset: u64,
-        len: u64,
-    ) -> Result<Vec<u8>> {
-        if len == 0 {
-            return Ok(Vec::new());
-        }
-        let end = offset.saturating_add(len);
-        if end > size {
-            bail!("要 {offset}..{end}，但这个文件只有 {size} 字节");
-        }
-
-        // 对齐到块边界，再往外多要一块。多要的那块下次读就在缓存里了。
-        let start = offset / BLOCK * BLOCK;
-        let fetch_end = end
-            .div_ceil(BLOCK)
-            .saturating_add(1)
-            .saturating_mul(BLOCK)
-            .min(size.max(BLOCK));
-        self.ensure_range(link, hash, start, fetch_end).await?;
-
-        self.inner
-            .store
-            .blobs()
-            .export_ranges(hash, offset..end)
-            .concatenate()
-            .await
-            .with_context(|| format!("从 store 读 {hash} 的 {offset}..{end} 失败"))
-    }
-
-    /// 把一个文件算成 hash 并放进 store，这样查看者能按 hash 取走它。
-    ///
-    /// **先查索引缓存（ADR-0002、ADR-0006 决策六）。** 没有它，同一个 4GB 文件取两次
-    /// 就 hash 两遍，而 mount 会让这个放大——`Open(path) → hash` 必须有便宜的来源。
-    ///
-    /// 注意缓存命中只解决「知道 hash」，还要核一次「字节在不在 store 里」：两件事
-    /// 同时成立才发得出去（`Store::has` 只对完整 blob 返回 true）。正常路径上它们
-    /// 一起成立，所以命中一次就是省下一次全量读。
-    ///
-    /// 还有一条已知的浪费：`add_path` 会**把文件复制进 store**——ADR-0001 里
-    /// 「用 TryReference 避免创建者侧复制」那条假设还没实现。实测 200MB 的文件会让
-    /// store 多出 200MB（Pi 上 store 1014MB / 源文件 960MB）。迟早得改用
-    /// `ImportMode::TryReference`。
-    pub async fn hash_file(&self, path: &Path) -> Result<(Hash, u64)> {
-        let meta = std::fs::metadata(path)
-            .with_context(|| format!("stat {} 失败", path.display()))?;
-        let size = meta.len();
-        let mtime = crate::listing::mtime_of(&meta);
-
-        if let Some(hash) = self.inner.index.read().await.lookup(path, size, mtime)
-            && self.inner.store.blobs().has(hash).await.unwrap_or(false)
-        {
-            return Ok((hash, size));
-        }
-
-        let tag = self
-            .inner
-            .store
-            .blobs()
-            .add_path(path)
-            .await
-            .with_context(|| format!("导入 {} 失败", path.display()))?;
-        let hash = tag.hash;
-        if let Err(e) = self.inner.index.write().await.remember(
-            &self.inner.data_dir,
-            path,
-            size,
-            mtime,
-            hash,
-        ) {
-            // 缓存落不了盘不该让取文件失败。
-            tracing::warn!(error = %e, "索引缓存没写下去");
-        }
-        Ok((hash, size))
+        let host = match host {
+            Some(h) => h,
+            None => crate::link::lan_addrs()?.preferred,
+        };
+        Ok(BasketLink::new(host, b.id))
     }
 
     // ---- 持久化 ----
@@ -551,32 +185,4 @@ fn load_baskets(data_dir: &Path) -> Result<Vec<Basket>> {
     let s = std::fs::read_to_string(&path)
         .with_context(|| format!("读不到 {}", path.display()))?;
     serde_json::from_str(&s).with_context(|| format!("{} 解析失败", path.display()))
-}
-
-/// identity key 是所有已发出 BasketLink 的锚点：丢了它就全部失效。
-/// 见 ADR-0003 的未决问题。
-fn load_or_create_identity(data_dir: &Path) -> Result<iroh::SecretKey> {
-    let path = data_dir.join("identity.key");
-    if path.exists() {
-        let s = std::fs::read_to_string(&path)?;
-        let bytes: [u8; 32] = hex::decode(s.trim())
-            .context("identity.key 不是合法 hex")?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("identity.key 长度不对"))?;
-        return Ok(iroh::SecretKey::from_bytes(&bytes));
-    }
-
-    let secret = iroh::SecretKey::generate();
-    std::fs::write(&path, hex::encode(secret.to_bytes()))?;
-    restrict_permissions(&path)?;
-    Ok(secret)
-}
-
-fn restrict_permissions(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
 }

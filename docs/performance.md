@@ -1,6 +1,8 @@
 # 性能调查记录
 
-一轮密集排查的账。**结论会过期，方法和"已排除清单"留下来。**
+一轮密集排查的账。**结论会过期，方法和“已排除清单”留下来。**
+
+> **注意：这份调查讲的是 iroh 那条传输，而它已经删掉了**（ADR-0007 决策六）。里面的数字不再描述产品现在的任何路径。留下来的是两样跟走哪条路无关的东西：**测量方法论**（profiler 会少采、`du` 会被 APFS 的 clonefile 骗、能数计数器就别比耗时），以及一张**“哪些路已经堵死”的负面地图**——将来真要把 iroh 加回来时，省得重走。
 
 ## 怎么测才不被骗
 
@@ -11,7 +13,7 @@
 - **能数确定性计数器就别比吞吐量。** 反向帧数、包数、CPU 时间都比吞吐稳定一个量级。
 - **测吞吐前必须清空接收端 store。** 否则命中的是本地副本，量到的是"导出"而不是
   "传输"——我因此把 200MB 的导出当成传输，算出过 1.2 GB/s 的假数。
-- **清空 store 之后要校验字节数/哈希**，别让失败的 pick 静默变成"很快"。
+- **清空 store 之后要校验字节数/哈希**，别让失败的 fetch 静默变成"很快"。
 - **绝对 CPU 用 `ps -o time`（单调计数器），别信 profiler 的绝对值。** `xctrace`
   的 Time Profiler 确实是按 CPU 时间采样（`sleep 10` 只报 1 个样本，不采阻塞线程——
   这点比 `sample` 强），**但它对多线程守护进程会少采**：同一进程 `ps` 量到 2.0 核，
@@ -78,7 +80,7 @@ loopback（MTU 16384）传 200MB：
 Ethernet with jumbo frames"*），但 **iroh 没有暴露 `max_udp_payload_size`**——
 它硬编码在 `iroh/src/socket.rs` 内部。只抬 `upper_bound` 会被对端声明的 1472 夹住。
 
-**注意：不要动 `initial_mtu`。** 抬到 16000 会把握手打死（pick 挂住 90s+）：握手就用
+**注意：不要动 `initial_mtu`。** 抬到 16000 会把握手打死（fetch 挂住 90s+）：握手就用
 `initial_mtu`，而对端还没准备收那么大的包，大包被静默丢弃。只抬 `upper_bound` 不会，
 因为发现发生在握手之后。
 
@@ -291,6 +293,20 @@ iperf3 -s -1 & iperf3 -c 127.0.0.1 -u -l 1452 -b 0 -t 5      # → 3.97 µs/包
 
 这也解释了之前那句「loopback 导出 547 MB/s」——快的是导出路径，不是 reader。
 ADR-0003 担心的「文件系统的读是小块、同步的……会慢到不可用」，指的就是这一层。
+
+### 7. iroh-blobs 的 store 语义 —— 几个查了很久才看清的地方
+
+“取字节 / 放进 store / 按范围读回来”这条路我们最后没走，但下面这些是读代码加实测才弄清的，重走时能省很多时间。
+
+**一个 blob 的数据有三种放法**（库自己的 `DESIGN.md`）：`inline`（在 redb 里）、`owned`（在 store 自己的规范目录里，路径可以从 hash 算出来）、`external`（在**用户自己的路径**里，路径必须显式存，一个 blob 记一组）。`ImportMode::TryReference` / `ExportMode::TryReference` 就是为 external 设计的：导入时“把文件编进目录、别复制”，导出时“**move** 到目标路径再记进目录”。outboard 永远不放用户路径。
+
+**删一个 external 条目不会碰用户那个文件。** `store/fs/meta.rs` 里是显式写的：`Inline` 删内联数据、`Owned` 标记删 store 里的文件、`External` **空分支什么都不做**。所以“搬出去 + 让 gc 扫掉条目”是安全的。
+
+**gc 的保留单位是 tag。** `run_gc` 从 `tags().list()` 和 `list_temp_tags()` 收集 live 集合，不在里面的全删；`GcConfig.add_protected` 是个回调，让你每次 gc 前再塞一批 hash 进去。**不传 gc 配置的话 `run_gc` 根本不启动**（`store/fs.rs`），也就是默认只增不减。`gc_run_once` 是公开的，可以按需手动跑。
+
+**读 external 位置不重新校验**：`DataLocation::External(paths, size)` 只按长度信，`File::open` 之后不比对内容。库自己的文档承认 “less safe since the file might be modified”。
+
+**macOS 上“复制一份”可能不花空间。** `reflink_or_copy` 先试 `reflink`，macOS 上就是 `clonefile`（APFS 写时复制）。实测：把一个 256 MiB 文件 `add_path` 进 store，卷只少了 **3 MiB**；`fetch` 下载 256 MiB 再导出到目标，卷只少了 **261 MiB**（真复制该是 512）。**`du` 对 clone 两边各自报满，所以判断空间占用必须看卷的空闲空间（`df -k`）前后差，不能用 `du`。**
 
 ## 更正过的错误结论
 
