@@ -27,6 +27,8 @@ struct BasketLink {
 
 ### 协议
 
+> **被 ADR-0006 改了。** listing 的单位从「整棵树」变成「一个目录」，请求从下面两个变成四个（`ListDir` / `Lookup` / `Open` / `Read`）。本节剩下的部分（两层成本的拆分、没有监听器、索引缓存是必需的、目录是响应不是制品）**仍然成立**，见 ADR-0006。
+
 自研 ALPN，两个请求：
 
 - `GetListing(basket_id)` → 创建者现算并返回目录 `[(路径, size, mtime)]`。
