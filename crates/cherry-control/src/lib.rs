@@ -44,9 +44,11 @@ pub enum Request {
     Link {
         basket: String,
     },
-    /// 打开别人的篮子，看里面有什么。
-    Open {
+    /// 列对方篮子的一个目录。
+    Ls {
         link: String,
+        /// 篮子内的相对路径，空串表示篮子根。
+        dir: String,
     },
     /// 从别人的篮子里取一个文件。
     Fetch {
@@ -221,9 +223,9 @@ async fn dispatch_inner(
             Ok(Response::Basket(view(&svc.basket(basket).await?)))
         }
         Request::Link { basket } => Ok(Response::Link(svc.link(basket).await?.to_string())),
-        Request::Open { link } => {
+        Request::Ls { link, dir } => {
             let link: cherry_core::BasketLink = link.parse().context("链接解析失败")?;
-            Ok(Response::Listing(svc.open(&link).await?))
+            Ok(Response::Listing(svc.list_dir(&link, dir).await?))
         }
         Request::Fetch { link, path, dest } => {
             let link: cherry_core::BasketLink = link.parse().context("链接解析失败")?;

@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use cherry_control::{CherryView, Client, Event, Request, Response};
+use cherry_core::CherryKind;
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -55,10 +56,12 @@ enum Cmd {
         /// 篮子名
         basket: String,
     },
-    /// 打开别人的篮子，看里面有什么
-    Open {
+    /// 列对方篮子里**一个目录**（ADR-0006：listing 的单位是一个目录，不是整棵树）
+    Ls {
         /// BasketLink
         link: String,
+        /// 篮子内的相对路径。不给就是篮子根。
+        path: Option<String>,
     },
     /// 从别人的篮子里挑一个文件下来
     Pick {
@@ -109,7 +112,10 @@ fn to_request(cmd: Cmd) -> Request {
         Cmd::Add { basket, path } => Request::AddCherry { basket, path },
         Cmd::Rm { basket, name } => Request::RemoveCherry { basket, name },
         Cmd::Link { basket } => Request::Link { basket },
-        Cmd::Open { link } => Request::Open { link },
+        Cmd::Ls { link, path } => Request::Ls {
+            link,
+            dir: path.unwrap_or_default(),
+        },
         Cmd::Pick { link, path, dest } => Request::Fetch { link, path, dest },
     }
 }
@@ -151,13 +157,18 @@ fn print(resp: Response) {
         }
         Response::Listing(entries) => {
             if entries.is_empty() {
-                println!("（对方的篮子是空的）");
+                println!("（这个目录是空的）");
             }
             for e in entries {
-                println!("{}  {}", human_size(e.size), e.path);
+                // 目录不给大小。它自己就是 0，而显示「0 B」是假的。
+                match e.kind {
+                    CherryKind::Dir => println!("{:>9}  {}/", "-", e.name),
+                    CherryKind::File => println!("{:>9}  {}", human_size(e.size), e.name),
+                }
             }
             println!();
-            println!("用 `cherry pick <链接> <路径> <存到哪>` 取下来。");
+            println!("进子目录：`cherry ls <链接> <路径>`");
+            println!("取文件：  `cherry pick <链接> <路径> <存到哪>`");
         }
         Response::Fetched(f) => {
             println!(

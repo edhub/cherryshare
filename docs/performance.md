@@ -249,7 +249,7 @@ blob 传输）。摊到多个核上只会付**任务迁移 + 跳核唤醒 + 工�
 **当前取值**：`CHERRY_WORKERS`，默认 **1**（见 `cherryd/src/main.rs` 的 `runtime()`）。
 
 **前提与代价**：1 个 worker 意味着任何阻塞调用都会卡住整个守护进程。已知的阻塞点
-已处理（`listing::scan` 进了 `spawn_blocking`；iroh-blobs 的 store 有自己的线程），
+已处理（`listing::list_dir` 进了 `spawn_blocking`；iroh-blobs 的 store 有自己的线程），
 但 **iroh/noq 内部没审计过**——出现“守护进程整体卡住”的怪象时先试 `CHERRY_WORKERS=4`。
 
 ## 那剩下的 ~6 倍：**已知、未解释、便宜手段已用尽**

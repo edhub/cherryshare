@@ -1,4 +1,8 @@
-//! 自研 ALPN 上的两个请求。见 ADR-0002。
+//! 自研 ALPN 上的请求。见 ADR-0002、ADR-0006。
+//!
+//! ADR-0006 定了四个原语（`ListDir` / `Lookup` / `Open` / `Read`）。这里现在有两个的
+//! 对应物：`ListDir`，以及 `GetFile`（它就是 `Open`——路径→hash——只是顺手多回一个
+//! size）。`Lookup` 与 `Read` 还没做。
 
 use anyhow::{Context, Result, bail};
 use iroh_blobs::Hash;
@@ -11,8 +15,9 @@ pub const ALPN: &[u8] = b"cherryshare/1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WireRequest {
-    /// 廉价：遍历 + stat，不算 hash。
-    GetListing { basket_id: [u8; 16] },
+    /// 廉价：列**一个**目录，遍历 + stat，不算 hash（ADR-0006 决策二）。
+    /// `dir` 是篮子内的相对路径，空串表示篮子根（cherry 列表）。
+    ListDir { basket_id: [u8; 16], dir: String },
     /// 昂贵：懒 rehash，耗时只与被点的那一个文件的大小成正比。
     GetFile { basket_id: [u8; 16], path: String },
 }

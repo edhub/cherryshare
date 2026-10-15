@@ -41,7 +41,7 @@ struct Args {
 /// （57.3 → 65.0 → 68.0 MB/s），而每字节成本完全平坦（~27 ns）。
 ///
 /// **代价与前提。** 1 个 worker 意味着任何一个阻塞调用都会卡住整个守护进程。
-/// 已知的阻塞点已经处理：`listing::scan`（同步目录遍历）丢进了 `spawn_blocking`；
+/// 已知的阻塞点已经处理：`listing::list_dir`（同步目录遍历）丢进了 `spawn_blocking`；
 /// iroh-blobs 的 store 有自己的线程（`iroh-blob-store-0`）做文件 I/O。
 /// **没审计过的是 iroh/noq 内部**——如果哪天出现“守护进程整体卡住”的怪象，
 /// 先试 `CHERRY_WORKERS=4` 排除这一条。

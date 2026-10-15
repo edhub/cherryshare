@@ -1,4 +1,4 @@
-//! 创建者侧：应答 GetListing / GetFile。
+//! 创建者侧：应答 ListDir / GetFile。
 
 use iroh::{endpoint::Connection, protocol::ProtocolHandler};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -40,11 +40,11 @@ impl Provider {
 
     async fn handle(&self, req: WireRequest) -> anyhow::Result<WireResponse> {
         match req {
-            WireRequest::GetListing { basket_id } => {
+            WireRequest::ListDir { basket_id, dir } => {
                 let basket = self.svc.basket_by_id(&basket_id).await?;
                 // 同步目录遍历丢进 blocking 线程：大目录可能走很久，而 cherryd 的 tokio
                 // worker 数刻意压得很低（见 cherryd 的 runtime()），不能让它把运行时卡住。
-                let entries = tokio::task::spawn_blocking(move || listing::scan(&basket))
+                let entries = tokio::task::spawn_blocking(move || listing::list_dir(&basket, &dir))
                     .await
                     .map_err(|e| anyhow::anyhow!("listing 任务没能跑完: {e}"))??;
                 Ok(WireResponse::Listing { entries })
