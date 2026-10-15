@@ -6,6 +6,7 @@
 | [0002](0002-basket-access.md) | basket 的访问方式 | Accepted |
 | [0003](0003-runtime-model.md) | 运行时模型 | Accepted |
 | [0004](0004-ui-form.md) | UI 形态 | Accepted |
+| [0005](0005-transport-stays-on-iroh.md) | 传输层留在 iroh / QUIC 上 | Accepted |
 
 ## 术语
 
@@ -51,9 +52,15 @@
 - 扫描用的文件监听器——触发点是 listing 请求本身
 - store 的 pin / GC 生命周期——store 里没有"只此一份"的数据
 
+**因为留在 iroh / QUIC 上**（ADR-0005）
+
+- 自研 TCP 传输层
+- QUIC-over-TCP（队头阻塞 + 用户态开销一分不省）
+
 ## 其他文档
 
 - [`../errors.md`](../errors.md) —— 失败清单。
+- [`../performance.md`](../performance.md) —— 性能调查记录（已排除清单、实测数据、自我更正）。
 - [`../../spikes/gpui-ui/`](../../spikes/gpui-ui/) —— gpui-kit 的验证 spike（ADR-0004 的依据）。
 
 ## 已推迟

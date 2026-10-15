@@ -153,6 +153,7 @@ profile 剩下的三个线索（都还没验证）：
 约 1.5×，**而且那 1.5× 不是 CPU 造成的**（Pi 的 CPU 只占 6~12%）。
 
 **所以现在不值得换内核 TCP。** 触发重新考虑的条件：出现一条 ≥500 Mbit/s 的链路。
+（已固化成 [ADR-0005](adr/0005-transport-stays-on-iroh.md)。）
 
 ### iroh 的 custom transports 帮不上忙
 
