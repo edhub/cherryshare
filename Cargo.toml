@@ -2,6 +2,19 @@
 resolver = "3"
 members = ["crates/cherry-core", "crates/cherry-control", "crates/cherryd", "crates/cherry"]
 
+# 专供性能分析：跟 release 一样优化，但带符号。
+# `sample` / `instruments` 对无符号的 release 二进制只能给 `???`。
+# `strip = "none"` 和 `package."*".debug` 是必需的：全局 ~/.cargo/config.toml
+# 里设了 `[profile.release] strip = true`，而这个 profile 继承自它。
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = "none"
+
+[profile.profiling.package."*"]
+debug = true
+strip = "none"
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"

@@ -280,6 +280,12 @@ impl Service {
         })
     }
 
+    /// 取一个文件的字节。
+    ///
+    /// 试过把一次下载切成 N 段、开 N 条独立连接并发取（`CHERRY_STREAMS`，已删）：**没用**。
+    /// N=1/2 都是 56 MB/s，N=4 降到 51，N=8 降到 43；两个客户端同时拉也一样（各剩一半，
+    /// 换成两个不同的 blob 也一样）。说明瓶颈是**每进程一个、所有连接共享的**东西，
+    /// 而不是某条连接的拥塞窗口。见 docs/performance.md。
     async fn download_blob(
         &self,
         hash: Hash,
