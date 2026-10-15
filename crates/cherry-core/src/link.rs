@@ -133,6 +133,24 @@ impl BasketLink {
         hex::decode(s).ok()?.try_into().ok()
     }
 
+    /// 挂载点的最后一段：`<篮子名>-<id 前 8 位>`。两个系统各自拼自己的父目录
+    /// （macOS 是 `~/cherry/`，Linux 是 `/mnt/`）。
+    ///
+    /// 名字是给人读的（`ls ~/cherry` 一眼能认出来），那 8 位是防重名的：不同人发过来的
+    /// 篮子可能同名，而挂载命令是在**对方**机器上执行的，我们不知道他那儿挂了什么。
+    /// 篮子名允许哪些字符由 `basket::validate_basket_name` 管（它得能安全地进这行命令）。
+    ///
+    /// 注意 **Finder 里显示的不是这个名字**：那用的是卷名，NFS 取的是导出路径的最后一段
+    /// （也就是完整 id），改不了。
+    pub fn mountpoint_leaf(&self, basket_name: &str) -> String {
+        let short = &self.basket_id_hex()[..8];
+        if basket_name.is_empty() {
+            short.to_owned()
+        } else {
+            format!("{basket_name}-{short}")
+        }
+    }
+
     /// 挂载命令里的 `server:/path`。
     pub fn mount_source(&self) -> String {
         format!("{}:/{}", self.host, self.basket_id_hex())
@@ -403,6 +421,16 @@ mod tests {
         if let Ok(a) = lan_addrs() {
             assert!(!a.others.contains(&a.preferred), "{a:?}");
         }
+    }
+
+    #[test]
+    fn 挂载点用篮子名加短_id() {
+        let link = sample();
+        assert_eq!(link.mountpoint_leaf("我的照片"), "我的照片-07070707");
+        assert_eq!(link.mountpoint_leaf(""), "07070707", "没名字就只剩 id");
+        // 两个同名篮子靠短 id 分开。
+        let other = BasketLink::new(sample().host, [8u8; 16]);
+        assert_ne!(link.mountpoint_leaf("照片"), other.mountpoint_leaf("照片"));
     }
 
     #[test]

@@ -34,7 +34,7 @@ pub struct Basket {
 
 impl Basket {
     pub fn new(name: &str) -> Result<Self> {
-        validate_name(name).context("basket 名不合法")?;
+        validate_basket_name(name).context("basket 名不合法")?;
         let mut id = [0u8; 16];
         getrandom::getrandom(&mut id).map_err(|e| anyhow::anyhow!("取随机数失败: {e}"))?;
         Ok(Self {
@@ -73,7 +73,7 @@ impl Basket {
             .and_then(|n| n.to_str())
             .with_context(|| format!("{} 没有可用的文件名", source.display()))?
             .to_owned();
-        validate_name(&name).context("cherry 名不合法")?;
+        validate_cherry_name(&name).context("cherry 名不合法")?;
         if self.cherry(&name).is_some() {
             bail!("篮子里已经有一颗叫 `{name}` 的 cherry 了");
         }
@@ -94,8 +94,11 @@ impl Basket {
 }
 
 /// 名字会变成 listing 里的路径段，所以不能含分隔符、不能是 `.` / `..`。
-/// 名字：不能带路径分隔符。
-fn validate_name(name: &str) -> Result<()> {
+/// cherry 名：不能带路径分隔符。
+///
+/// 这个名字来自磁盘上的文件名，也会成为 listing 路径的一段，所以只判这一点就行——
+/// 它不会进任何要粘进 shell 的命令（篮子名才会，见 [`validate_basket_name`]）。
+fn validate_cherry_name(name: &str) -> Result<()> {
     if name.is_empty() {
         bail!("名字不能为空");
     }
@@ -104,6 +107,28 @@ fn validate_name(name: &str) -> Result<()> {
     }
     if name.contains('/') || name.contains('\\') || name.contains('\0') {
         bail!("名字里不能有路径分隔符");
+    }
+    Ok(())
+}
+
+/// basket 名：比 cherry 名严一档。
+///
+/// 因为这个名字会出现在 `cherry link` 打出来的那行挂载命令里（`~/cherry/<名字>-<短 id>`），
+/// 人要拷进 shell 去粘。只收字母数字（中文、日文、韩文都算）和 `-` `_` `.`，且不以 `-` `.`
+/// 开头（一个会被当成选项，一个会变成隐藏目录）。
+///
+/// 空格过不了这一关，而 `my file.txt` 这种 cherry 名必须能进篮子——所以两条规则分开，
+/// 不是一回事。
+fn validate_basket_name(name: &str) -> Result<()> {
+    validate_cherry_name(name)?;
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        bail!("篮子名里只能用字母数字和 `-` `_` `.` —— 这个名字会进对方要粘的那行命令");
+    }
+    if name.starts_with(['-', '.']) {
+        bail!("`{name}` 不能以 `-` 或 `.` 开头");
     }
     Ok(())
 }
@@ -149,7 +174,38 @@ mod tests {
         assert!(Basket::new("").is_err());
     }
 
+    /// 篮子名会进对方要粘的那行命令，所以比 cherry 名严。
+    #[test]
+    fn 篮子名不能带_shell_认得的字符() {
+        for bad in [
+            "我的 照片",
+            "a;b",
+            "a|b",
+            "$(id)",
+            "a`b",
+            "a'b",
+            "a\nb",
+            "-x",
+            ".hidden",
+        ] {
+            assert!(Basket::new(bad).is_err(), "该拒：{bad:?}");
+        }
+        // 中日韩在 shell 里是普通字符，照样收。
+        assert!(Basket::new("我的照片").is_ok());
+        assert!(Basket::new("my-photos_2026.1").is_ok());
+    }
+
     /// cherry 名来自磁盘上的文件名——`my file.txt` 这种必须能进篮子，而它只出现在
+    /// listing 里，不进任何命令。
+    #[test]
+    fn cherry_名可以带空格() {
+        let dir = tempdir();
+        let f = dir.join("my file.txt");
+        std::fs::write(&f, b"hi").unwrap();
+        let mut b = Basket::new("t").unwrap();
+        assert!(b.add(&f).is_ok());
+    }
+
     #[test]
     fn id_是随机的() {
         let a = Basket::new("x").unwrap();

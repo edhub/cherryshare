@@ -67,6 +67,12 @@ enum Cmd {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    // 挂载点的最后一段要用篮子名，而 `to_request` 会把 cmd 吃掉。
+    let basket = match &cli.cmd {
+        Cmd::Link { basket, .. } => basket.clone(),
+        _ => String::new(),
+    };
+
     let data_dir = match cli.data_dir {
         Some(d) => d,
         None => cherry_core::service::default_data_dir()?,
@@ -74,7 +80,7 @@ async fn main() -> Result<()> {
     let mut client = Client::connect(&data_dir).await?;
     match client.call(&to_request(cli.cmd)?).await? {
         Response::Error(e) => bail!("{e}"),
-        other => print(other),
+        other => print(other, &basket),
     }
     Ok(())
 }
@@ -113,7 +119,7 @@ fn absolute(path: PathBuf) -> Result<PathBuf> {
     })
 }
 
-fn print(resp: Response) {
+fn print(resp: Response, basket: &str) {
     match resp {
         Response::Error(_) => {}
         Response::Status {
@@ -161,9 +167,13 @@ fn print(resp: Response) {
                     (
                         MountOs::Macos,
                         "macOS",
-                        format!("~/cherry/{}", &link.basket_id_hex()[..8]),
+                        format!("~/cherry/{}", link.mountpoint_leaf(basket)),
                     ),
-                    (MountOs::Linux, "Linux", "/mnt/cherry".to_owned()),
+                    (
+                        MountOs::Linux,
+                        "Linux",
+                        format!("/mnt/{}", link.mountpoint_leaf(basket)),
+                    ),
                 ] {
                     println!("  {name}");
                     println!("    {}", link.mount_command(os, &mnt));
