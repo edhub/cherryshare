@@ -1,10 +1,10 @@
 //! 目录是现算的响应，不是制品。见 ADR-0002。
 //!
-//! 单位是**一个目录**，不是整棵树（ADR-0006 决策二）：FUSE 的 `readdir` 本来就是按
+//! 单位是**一个目录**，不是整棵树（ADR-0002）：NFS 的 `readdir` 本来就是按
 //! 目录的，而整棵树意味着「为了显示一个目录，要取回整棵树」。
 //!
-//! `list_dir` 只做廉价的那一半：遍历 + stat，不算 hash（那在 `GetFile` 时才做）。
-//! 所以打开一个目录总是很快，哪怕创建者刚改了几十 GB。
+//! `list_dir` 只做廉价的那一半：遍历 + stat，不读内容。所以打开一个目录总是很快，
+//! 哪怕创建者刚改了几十 GB。
 //!
 //! **共享的只有真文件和真目录。** 符号链接不共享：一个指向别处的链接等于绕开了
 //! `..` 的封锁，而两者都是「爬出共享树」。判断只有一处（[`servable`]），列目录和
@@ -26,6 +26,11 @@ pub struct Entry {
     pub size: u64,
     /// Unix 秒。目录也填真实 mtime（见 [`entry`]）。
     pub mtime: u64,
+    /// 源文件带不带执行位。
+    ///
+    /// 报这个是因为对方可能要把文件拷出去跑（共享一包二进制就是这种情况）：只读导出
+    /// 把权限位一律报成 `0o444` 的话，`cp` 出来的东西没有执行位，跑不起来。
+    pub exec: bool,
 }
 
 /// 列**一个**目录。`dir` 是篮子内的相对路径，空串表示篮子根（也就是 cherry 列表）。
@@ -165,7 +170,14 @@ fn entry(name: &str, full: &std::path::Path) -> Result<Option<Entry>> {
         // 目录也有 mtime，而且**必须填真的**：NFS 客户端靠它判断目录列表要不要重取，
         // 填 0 就等于「永远不刷新」。
         mtime: mtime_of(&meta),
+        exec: exec_of(&meta),
     }))
+}
+
+/// 源文件带不带执行位。判断只在这一处，列目录和问单个条目都说同一句话。
+pub fn exec_of(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o111 != 0
 }
 
 pub fn mtime_of(meta: &std::fs::Metadata) -> u64 {

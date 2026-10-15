@@ -125,11 +125,16 @@ impl BasketNfs {
             .map_err(|_| nfsstat3::NFS3ERR_NOENT)
     }
 
-    /// 只读导出，权限位就照只读报。
+    /// 只读导出，权限位怎么报。
     ///
-    /// uid/gid 一律报 0，不透创建者的身份：这是共享出去的一份只读内容，不是那台机器
-    /// 延伸出来的文件系统。
-    fn fattr(id: fileid3, is_dir: bool, size: u64, mtime: u64) -> fattr3 {
+    /// **写位一律清掉**，哪怕源文件可写：这个导出不接受写，报可写就是骗客户端。
+    /// **执行位照实报**：一个二进制在挂载点上被报成 `0o444`，对方 `cp` 出来就没有
+    /// 执行位、跑不起来。共享一包可执行文件是正经用例。
+    fn perm(is_dir: bool, exec: bool) -> u32 {
+        if is_dir || exec { 0o555 } else { 0o444 }
+    }
+
+    fn fattr(id: fileid3, is_dir: bool, exec: bool, size: u64, mtime: u64) -> fattr3 {
         let t = nfstime3 {
             seconds: mtime.min(u32::MAX as u64) as u32,
             nseconds: 0,
@@ -140,8 +145,10 @@ impl BasketNfs {
             } else {
                 ftype3::NF3REG
             },
-            mode: if is_dir { 0o555 } else { 0o444 },
+            mode: Self::perm(is_dir, exec),
             nlink: 1,
+            // uid/gid 一律报 0，不透创建者的身份：这是共享出去的一份只读内容，
+            // 不是那台机器延伸出来的文件系统。
             uid: 0,
             gid: 0,
             size,
@@ -155,31 +162,6 @@ impl BasketNfs {
         }
     }
 
-    /// 篮子根的 mtime 是折出来的，磁盘上没有东西可以 stat。
-    ///
-    /// 不能给常数：客户端靠目录 mtime 判断列表要不要重取，常数等于「永远不刷新」。
-    /// 折的是 cherry 的名字和源路径，所以增、删、改名会变；文件内容变化不影响根这一层
-    /// 的**名字集合**，那归文件自己的 mtime 管。
-    ///
-    /// 已知缺口：同一个名字被重新指向另一个文件时，根这层的 mtime 不变。影响限于
-    /// 客户端缓存的 size/mtime 显示，而文件自身的 getattr 是实时的，`acregmax` 到点就
-    /// 纠正了。
-    fn root_mtime(basket: &Basket) -> u64 {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a
-        for c in &basket.cherries {
-            for b in c
-                .name
-                .as_bytes()
-                .iter()
-                .chain(c.source.as_os_str().as_encoded_bytes())
-            {
-                h = (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3);
-            }
-            h = h.wrapping_mul(0x100_0000_01b3);
-        }
-        // 落在 2020 年之后，免得显示成 1970。
-        1_600_000_000 + (h % 1_000_000_000)
-    }
 }
 
 #[async_trait]
@@ -256,12 +238,13 @@ impl NFSFileSystem for BasketNfs {
                 Ok(Self::fattr(
                     id,
                     is_dir,
+                    listing::exec_of(&meta),
                     if is_dir { 0 } else { meta.len() },
                     listing::mtime_of(&meta),
                 ))
             }
-            // 篮子根没有磁盘对应物，mtime 只能折出来。
-            None => Ok(Self::fattr(id, true, 0, Self::root_mtime(&basket))),
+            // 篮子根没有磁盘对应物，但它也有一个真实的时间：篮子定义那个文件的 mtime。
+            None => Ok(Self::fattr(id, true, false, 0, self.svc.baskets_mtime())),
         }
     }
 
@@ -321,6 +304,7 @@ impl NFSFileSystem for BasketNfs {
             let attr = Self::fattr(
                 fid,
                 matches!(e.kind, CherryKind::Dir),
+                e.exec,
                 e.size,
                 e.mtime,
             );
@@ -439,20 +423,15 @@ mod tests {
     }
 
     #[test]
-    fn 根目录的_mtime_会随增删改名变化() {
-        let mut b = Basket::new("t").unwrap();
-        let m0 = BasketNfs::root_mtime(&b);
-        assert_eq!(BasketNfs::root_mtime(&b), m0, "没变就该一样");
-
-        let dir = std::env::temp_dir().join(format!("cherry-nfs-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a"), b"x").unwrap();
-        b.add(&dir).unwrap();
-
-        let m1 = BasketNfs::root_mtime(&b);
-        assert_ne!(m0, m1, "加了一颗 cherry，根这层必须变");
-        assert!(m1 > 1_600_000_000, "别折出 1970 那种值");
-        let _ = std::fs::remove_dir_all(&dir);
+    fn 只读但带执行位() {
+        // 目录：能读能进。
+        assert_eq!(BasketNfs::perm(true, false), 0o555);
+        assert_eq!(BasketNfs::perm(true, true), 0o555);
+        // 文件：可读不可写，执行位照实报。
+        assert_eq!(BasketNfs::perm(false, false), 0o444);
+        assert_eq!(BasketNfs::perm(false, true), 0o555);
+        for p in [0o555, 0o444] {
+            assert_eq!(p & 0o222, 0, "写位必须一个都不剩：{p:o}");
+        }
     }
 }

@@ -154,6 +154,19 @@ impl Service {
         self.inner.data_dir.join("baskets.json")
     }
 
+    /// 篮子定义那个文件的 mtime。
+    ///
+    /// 这是给 NFS 用的：篮子根在磁盘上没有对应物，是个虚拟目录，但它得有一个**真的**
+    /// 时间。而「篮子的定义变了吗」是有对应物的——配置文件本身就是这件事的记录：
+    /// 增、删、改一颗 cherry 都会碰它，改文件内容不会（那是文件自己的 mtime 管的事）。
+    ///
+    /// 文件不存在就报 0（正常跑不到：能问到篮子根，说明那个篮子已经在配置里了）。
+    pub fn baskets_mtime(&self) -> u64 {
+        std::fs::metadata(self.baskets_path())
+            .map(|m| crate::listing::mtime_of(&m))
+            .unwrap_or(0)
+    }
+
     async fn persist(&self) -> Result<()> {
         let baskets = self.inner.baskets.read().await;
         let json = serde_json::to_string_pretty(&*baskets)?;
