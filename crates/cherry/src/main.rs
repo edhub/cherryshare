@@ -24,10 +24,6 @@ use clap::{CommandFactory, Parser, Subcommand};
     disable_version_flag = true
 )]
 struct Cli {
-    /// 数据目录。默认在系统的应用数据目录里（macOS 是 `~/Library/Application Support/cherryshare`）
-    #[arg(long, env = "CHERRYSHARE_DATA_DIR", global = true)]
-    data_dir: Option<PathBuf>,
-
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -102,10 +98,9 @@ async fn main() -> Result<()> {
         detail: matches!(cmd, Cmd::Show { basket: None }),
     };
 
-    let data_dir = match cli.data_dir {
-        Some(d) => d,
-        None => cherry_core::service::default_data_dir()?,
-    };
+    // 数据目录不做成选项：正常用的人就只有默认那一个，摆到帮助里是多余的。要开第二个
+    // 实例（e2e）就设 `CHERRYSHARE_DATA_DIR`——`default_data_dir()` 会读。
+    let data_dir = cherry_core::service::default_data_dir()?;
     let mut client = Client::connect(&data_dir).await?;
     match client.call(&to_request(cmd)?).await? {
         Response::Error(e) => bail!("{e}"),
@@ -297,5 +292,11 @@ mod tests {
     #[test]
     fn add_还是得两个参数() {
         assert!(Cli::try_parse_from(["cherry", "add", "篮子"]).is_err());
+    }
+
+    /// 数据目录不给用户选（正常用不到），客户端就不认这个选项。
+    #[test]
+    fn 没有_data_dir_这个选项() {
+        assert!(Cli::try_parse_from(["cherry", "--data-dir", "/tmp", "list"]).is_err());
     }
 }

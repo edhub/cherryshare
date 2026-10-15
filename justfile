@@ -1,7 +1,7 @@
 # CherryShare 的常用任务。`just` 列出来，`just <名字>` 跑。
 #
 #   just check                  提交之前跑：格式、lint、测试
-#   just dev-install            编好装到本机（~/.local/bin），并让 launchd 重启服务
+#   just install                从源码编一份装到本机，并让 launchd 重启服务
 #   just e2e                    端到端跑一遍：临时数据目录起服务、挂上、比对、卸掉
 #   just release 0.2.0          出一个版本：编两份、组包、算校验和
 #
@@ -23,8 +23,9 @@ check:
     cargo clippy --workspace --all-targets
     cargo test --workspace
 
-# 编好装到本机，并让服务重启到这一份（开发用）
-dev-install:
+# 从源码编一份装到本机（~/.local/bin），并让服务重启到这一份。
+# 包里的那份走 `bash packaging/install.sh`，不是这条。
+install:
     cargo build --release --workspace
     mkdir -p "$HOME/.local/bin"
     cp target/release/cherry target/release/cherryd "$HOME/.local/bin/"
@@ -55,7 +56,7 @@ e2e:
     trap 'umount "$MP" 2>/dev/null || true; kill "$SVC" 2>/dev/null || true; rm -rf "$D" "$BASE" "$MP"' EXIT
 
     for _ in $(seq 50); do [ -S "$D/cherryd.sock" ] && break; sleep 0.1; done
-    cherry() { "$CHERRY" --data-dir "$D" "$@"; }
+    cherry() { CHERRYSHARE_DATA_DIR="$D" "$CHERRY" "$@"; }
 
     head -c 200000 /dev/urandom >"$SRC/big.bin"
     echo hi >"$SRC/sub/a.txt"
