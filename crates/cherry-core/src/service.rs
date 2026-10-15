@@ -20,6 +20,7 @@ use tokio::sync::RwLock;
 use crate::{
     basket::Basket,
     endpoint,
+    index::Index,
     link::BasketLink,
     listing::Entry,
     proto::{ALPN, WireRequest, WireResponse, read_frame, write_frame},
@@ -54,6 +55,8 @@ struct Inner {
     store: Store,
     /// 唯一的持久状态里，这份是「设计选择」而不是「OS 强制」（ADR-0003）。
     baskets: RwLock<Vec<Basket>>,
+    /// 索引缓存（ADR-0002 要求）。也是「设计选择」那一类：坏了只丢缓存，不丢数据。
+    index: RwLock<Index>,
 }
 
 impl std::fmt::Debug for Service {
@@ -84,6 +87,11 @@ impl Service {
         let store: Store = fs.into();
 
         let baskets = load_baskets(&data_dir)?;
+        // 缓存读不了不该让服务起不来——它只是缓存。
+        let index = Index::load(&data_dir).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "索引缓存读不了，当作空的");
+            Index::default()
+        });
         tracing::info!(
             endpoint = %ep.id(),
             baskets = baskets.len(),
@@ -96,6 +104,7 @@ impl Service {
                 endpoint: ep,
                 store,
                 baskets: RwLock::new(baskets),
+                index: RwLock::new(index),
             }),
         })
     }
@@ -197,14 +206,15 @@ impl Service {
 
     // ---- 查看者侧 ----
 
-    /// 拉对方的 listing。快：对面只做遍历 + stat。
-    pub async fn open(&self, link: &BasketLink) -> Result<Vec<Entry>> {
+    /// 列对方篮子里**一个目录**。快：对面只做一次 `readdir` + 每个 entry 一次 `stat`。
+    pub async fn list_dir(&self, link: &BasketLink, dir: &str) -> Result<Vec<Entry>> {
         let conn = self.connect(link).await?;
         let (mut send, mut recv) = conn.open_bi().await.context("开流失败")?;
         write_frame(
             &mut send,
-            &WireRequest::GetListing {
+            &WireRequest::ListDir {
                 basket_id: link.basket_id,
+                dir: dir.to_owned(),
             },
         )
         .await?;
@@ -343,12 +353,29 @@ impl Service {
 
     /// 把一个文件算成 hash 并放进 store，这样查看者能按 hash 取走它。
     ///
-    /// 注意：`add_path` 会**把文件复制进 store**——ADR-0001 里「用 TryReference 避免
-    /// 创建者侧复制」那条假设还没实现。实测 200MB 的文件会让 store 多出 200MB
-    /// （Pi 上 store 1014MB / 源文件 960MB）。store 本来就可淘汰（ADR-0001），
-    /// 但这是真金白银的磁盘占用，迟早得改用 `ImportMode::TryReference`。
+    /// **先查索引缓存（ADR-0002、ADR-0006 决策六）。** 没有它，同一个 4GB 文件取两次
+    /// 就 hash 两遍，而 mount 会让这个放大——`Open(path) → hash` 必须有便宜的来源。
+    ///
+    /// 注意缓存命中只解决「知道 hash」，还要核一次「字节在不在 store 里」：两件事
+    /// 同时成立才发得出去（`Store::has` 只对完整 blob 返回 true）。正常路径上它们
+    /// 一起成立，所以命中一次就是省下一次全量读。
+    ///
+    /// 还有一条已知的浪费：`add_path` 会**把文件复制进 store**——ADR-0001 里
+    /// 「用 TryReference 避免创建者侧复制」那条假设还没实现。实测 200MB 的文件会让
+    /// store 多出 200MB（Pi 上 store 1014MB / 源文件 960MB）。迟早得改用
+    /// `ImportMode::TryReference`。
     pub async fn hash_file(&self, path: &Path) -> Result<(Hash, u64)> {
-        let size = std::fs::metadata(path)?.len();
+        let meta = std::fs::metadata(path)
+            .with_context(|| format!("stat {} 失败", path.display()))?;
+        let size = meta.len();
+        let mtime = crate::listing::mtime_of(&meta);
+
+        if let Some(hash) = self.inner.index.read().await.lookup(path, size, mtime)
+            && self.inner.store.blobs().has(hash).await.unwrap_or(false)
+        {
+            return Ok((hash, size));
+        }
+
         let tag = self
             .inner
             .store
@@ -356,7 +383,18 @@ impl Service {
             .add_path(path)
             .await
             .with_context(|| format!("导入 {} 失败", path.display()))?;
-        Ok((tag.hash, size))
+        let hash = tag.hash;
+        if let Err(e) = self.inner.index.write().await.remember(
+            &self.inner.data_dir,
+            path,
+            size,
+            mtime,
+            hash,
+        ) {
+            // 缓存落不了盘不该让取文件失败。
+            tracing::warn!(error = %e, "索引缓存没写下去");
+        }
+        Ok((hash, size))
     }
 
     // ---- 持久化 ----

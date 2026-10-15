@@ -6,6 +6,7 @@
 
 pub mod basket;
 pub mod endpoint;
+pub mod index;
 pub mod link;
 pub mod listing;
 pub mod proto;
