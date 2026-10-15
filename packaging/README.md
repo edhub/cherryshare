@@ -53,7 +53,8 @@ Ctrl-C 停）。然后：
 
 把 `cherry link <篮子名>` 打出来的整段发给对方就行。链接里默认是你的本机名（`mbpmax.local`
 这种），同一个局域网里的对方能用，而且你换了 DHCP 地址链接还成立。对方要是走路由或
-隧道过来的（VPN、别的网段），名字过不去，得换成 IP——`cherry link` 会把候选地址印出来。
+隧道过来的（VPN、别的网段），名字过不去，得换成 IP：`cherry link 我的照片 --host
+10.1.2.52`（自己机器的地址：`ipconfig getifaddr en0`）。
 
 别的：
 

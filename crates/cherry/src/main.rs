@@ -16,9 +16,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 #[derive(Debug, Parser)]
 #[command(
     name = "cherry",
-    version,
-    about = "CherryShare —— 把一篮樱桃递给别人",
-    // 敲 `cherry` 本身就是问“我能干什么”，所以不带参数就把帮助和版本一起打出来，
+    // 敲 `cherry` 本身就是问“我能干什么”，所以不带参数就把名字、版本和帮助一起打出来，
     // `-h` / `-V` 这两个 flag 不要（子命令的用法还有 clap 自带的 `cherry help <命令>`）。
     disable_help_flag = true,
     disable_version_flag = true
@@ -34,7 +32,7 @@ enum Cmd {
     Status,
     /// 列出本机所有 basket
     List,
-    /// 建一个 basket
+    /// 建一个 basket，你可以往 basket 中添加你想要共享的文件、文件夹
     New {
         /// 篮子名
         name: String,
@@ -79,24 +77,20 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let Some(cmd) = cli.cmd else {
-        // 敲 `cherry` 就是在问“我这台机器上能干什么”，帮助和版本一起给。
-        println!("{}", Cli::command().render_version());
+        // 敲 `cherry` 就是在问“这是什么、哪一版、能干什么”。这句话只在 banner 里说一遍，
+        // 所以命令上没有 `about`——帮助里不再重复。
+        println!(
+            "CherryShare {} 好用的局域网文件共享工具",
+            env!("CARGO_PKG_VERSION")
+        );
+        println!();
         Cli::command().print_long_help()?;
         println!();
         return Ok(());
     };
 
-    // “详情还是点名”“整段还是只列链接”，这些只有客户端知道（服务端只回数据，ADR-0003）。
-    let ctx = Ctx {
-        one: matches!(
-            cmd,
-            Cmd::Link {
-                basket: Some(_),
-                ..
-            }
-        ),
-        detail: matches!(cmd, Cmd::Show { basket: None }),
-    };
+    // “详情还是点名”只有客户端知道（服务端只回数据，ADR-0003）。
+    let detail = matches!(cmd, Cmd::Show { basket: None });
 
     // 数据目录不做成选项：正常用的人就只有默认那一个，摆到帮助里是多余的。要开第二个
     // 实例（e2e）就设 `CHERRYSHARE_DATA_DIR`——`default_data_dir()` 会读。
@@ -104,7 +98,7 @@ async fn main() -> Result<()> {
     let mut client = Client::connect(&data_dir).await?;
     match client.call(&to_request(cmd)?).await? {
         Response::Error(e) => bail!("{e}"),
-        other => print(other, &ctx),
+        other => print(other, detail),
     }
     Ok(())
 }
@@ -146,7 +140,8 @@ fn absolute(path: PathBuf) -> Result<PathBuf> {
     })
 }
 
-fn print(resp: Response, ctx: &Ctx) {
+/// `detail`：`cherry list` 只是点名，`cherry show` 不带篮子要的是每个篮子的详情。
+fn print(resp: Response, detail: bool) {
     match resp {
         Response::Error(_) => {}
         Response::Status {
@@ -173,7 +168,7 @@ fn print(resp: Response, ctx: &Ctx) {
             }
             for b in &list {
                 // `cherry list` 只是点名；`cherry show` 不带篮子要的是每个篮子的详情。
-                if ctx.detail {
+                if detail {
                     print_basket(b);
                 } else {
                     println!("{}  ({} 颗)", b.name, b.cherries.len());
@@ -181,32 +176,23 @@ fn print(resp: Response, ctx: &Ctx) {
             }
         }
         Response::Basket(b) => print_basket(&b),
-        // 单独问一个篮子，就把对方要用的东西印全；一次列好几个只列链接本身。
+        // 每个篮子都给整段（挂载命令在里面）。不止一个时先报名字，不然光看链接分不清哪条是哪条。
         Response::Links(list) => {
             if list.is_empty() {
                 println!("（还没有 basket。用 `cherry new <名字>` 建一个）");
-            } else if ctx.one && list.len() == 1 {
-                print_link(&list[0]);
             } else {
-                for l in &list {
-                    println!("{}  {}", l.name, l.link);
+                for (i, l) in list.iter().enumerate() {
+                    if i > 0 {
+                        println!();
+                    }
+                    if list.len() > 1 {
+                        println!("{}", l.name);
+                    }
+                    print_link(l);
                 }
-                hint_hosts();
             }
         }
     }
-}
-
-/// 打印时要的上下文。
-///
-/// 服务端只回数据（ADR-0003），怎么摆是客户端的事：同一个 `Response::Baskets`，在
-/// `cherry list` 底下是点名，在 `cherry show` 不带篮子时是逐条详情；同一条链接，
-/// 单独问的印全，一次列好几个就只列一行。
-struct Ctx {
-    /// 这条命令是冲一个篮子下的（`cherry link <名字>`）。
-    one: bool,
-    /// 逐条详情：`cherry show` 不带篮子。
-    detail: bool,
 }
 
 fn print_basket(b: &BasketView) {
@@ -223,7 +209,7 @@ fn print_basket(b: &BasketView) {
 fn print_link(l: &LinkView) {
     println!("{}", l.link);
     println!();
-    println!("把这条发给对方。他什么都不用装，在同一个局域网里粘对应的一行：");
+    println!("把这条发给对方，在 terminal 中运行即可：");
     if let Ok(link) = l.link.parse::<BasketLink>() {
         println!();
         for (os, name, mnt) in [
@@ -242,24 +228,6 @@ fn print_link(l: &LinkView) {
             println!("    {}", link.mount_command(os, &mnt));
             println!("    卸掉：{}", BasketLink::unmount_command(os, &mnt));
         }
-        hint_hosts();
-    }
-}
-
-fn hint_hosts() {
-    // 链接默认是本机名，而名字只在同一个广播域里解析得了（mDNS 是组播，过不了路由，
-    // 也过不了隧道）。所以把地址候选印出来：对方走别处就换 IP。
-    if let Ok(addrs) = cherry_core::link::lan_addrs() {
-        let mut list: Vec<String> = vec![addrs.preferred.to_string()];
-        list.extend(addrs.others.iter().map(|a| a.to_string()));
-        println!(
-            "  对方走路由或隧道就换成 IP（挑的是 {}）：",
-            addrs.preferred
-        );
-        println!(
-            "    cherry link <篮子名> --host <其中一个>   {}",
-            list.join("  ")
-        );
     }
 }
 
