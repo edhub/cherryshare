@@ -175,7 +175,7 @@ async fn list_json(
         Err(_) => return plain(StatusCode::INTERNAL_SERVER_ERROR, "列目录的任务挂了"),
     };
 
-    // 挂载命令里的主机用对方访问时用的那个：他要是从 IP 进来的，给他名字没意义。
+    // 挂载命令里的主机默认用对方访问时用的那个；另一个（名字 ↔ IP）一并带上，供页面上切。
     let link = match request_host(headers) {
         Some(h) => BasketLink::new(h, basket.id),
         None => match app.svc.link(&basket.name).await {
@@ -188,6 +188,7 @@ async fn list_json(
             }
         },
     };
+    let alt = cherry_core::link::alternate_host(&link.host).map(|h| BasketLink::new(h, basket.id));
     let mounts = [(MountOs::Macos, "macOS"), (MountOs::Linux, "Linux")]
         .into_iter()
         .map(|(os, label)| {
@@ -198,6 +199,7 @@ async fn list_json(
             MountJson {
                 label,
                 command: link.mount_command(os, &mountpoint),
+                alt_command: alt.as_ref().map(|l| l.mount_command(os, &mountpoint)),
                 unmount: BasketLink::unmount_command(os, &mountpoint),
                 mountpoint,
             }
@@ -208,6 +210,8 @@ async fn list_json(
         name: basket.name.clone(),
         id: link.basket_id_hex(),
         link: link.to_string(),
+        host: HostJson::from_host(&link.host),
+        alt_host: alt.as_ref().map(|l| HostJson::from_host(&l.host)),
         path: sub.unwrap_or_default(),
         mounts,
         cherries: entries
@@ -535,10 +539,31 @@ struct ListJson {
     name: String,
     id: String,
     link: String,
+    host: HostJson,
+    alt_host: Option<HostJson>,
     /// 这次列的是篮子内哪一层（空串是根）。
     path: String,
     mounts: Vec<MountJson>,
     cherries: Vec<CherryJson>,
+}
+
+#[derive(Serialize)]
+struct HostJson {
+    /// `"name"` / `"ip"`。
+    kind: &'static str,
+    addr: String,
+}
+
+impl HostJson {
+    fn from_host(h: &Host) -> Self {
+        Self {
+            kind: match h {
+                Host::Name(_) => "name",
+                Host::Ip(_) => "ip",
+            },
+            addr: h.to_string(),
+        }
+    }
 }
 
 /// 这次请求带的参数：`?path=<篮子内相对路径>`，以及 `?dl=zip`（打包整个目录）。
@@ -553,6 +578,7 @@ struct MountJson {
     label: &'static str,
     mountpoint: String,
     command: String,
+    alt_command: Option<String>,
     unmount: String,
 }
 

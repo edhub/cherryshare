@@ -395,22 +395,42 @@ function listCard(data) {
 // ---- 挂载说明（右上角的复制按钮 + 展开面板） ----
 
 let mounts = [];
+let host = null;
+let altHost = null;
+let useAltHost = false;
 let expanded = false;
 
 function pickedMount() {
   return mounts.find((m) => m.label === visitorOS()) ?? mounts[0];
 }
 
+function cmdOf(m) {
+  return useAltHost && m.alt_command ? m.alt_command : m.command;
+}
+
+/** 切换按钮上的字：要换成的地址直接写出来——title 手机上看不见。 */
+function flipHostText(target) {
+  return `${target.kind === "ip" ? "换成 IP" : "换成主机名"} ${target.addr}`;
+}
+
 function mountPanelHtml() {
-  const tabs = mounts.map((m, i) => `
+  const next = useAltHost ? host : altHost;
+  const flipBtn = next
+    ? `<button type="button" class="btn btn-sm btn-ghost" data-flip-host title="名字过不了路由和隧道，IP 会随 DHCP 变——这条不能用就换那条">${esc(flipHostText(next))}</button>`
+    : "";
+  const tabs = mounts.map((m, i) => {
+    const cmd = cmdOf(m);
+    return `
     <input type="radio" name="os" role="tab" class="tab" aria-label="${esc(m.label)}" ${i === 0 ? "checked" : ""}>
     <div role="tabpanel" class="tab-content bg-base-100 border-base-300 rounded-box p-4">
-      <pre class="text-xs whitespace-pre-wrap break-all">${esc(m.command)}</pre>
+      <pre class="text-xs whitespace-pre-wrap break-all">${esc(cmd)}</pre>
       <div class="mt-3 flex gap-2 items-center">
-        <button class="btn btn-sm btn-primary" data-copy="${esc(m.command)}">复制这行</button>
+        <button class="btn btn-sm btn-primary" data-copy="${esc(cmd)}">复制这行</button>
+        ${flipBtn}
         <span class="text-xs opacity-60">卸掉：<code>${esc(m.unmount)}</code></span>
       </div>
-    </div>`).join("");
+    </div>`;
+  }).join("");
   return `
     <section class="card bg-base-100 shadow-sm">
       <div class="card-body">
@@ -425,9 +445,29 @@ function mountPanelHtml() {
     </section>`;
 }
 
-function bindCopyButtons(scope) {
+/** 原地换掉两个标签页里的命令和按钮字，不动当前选中的系统标签页。 */
+function refreshMountCommands() {
+  const next = useAltHost ? host : altHost;
+  mountPanel.querySelectorAll("[role=tabpanel]").forEach((panel, i) => {
+    const m = mounts[i];
+    if (!m) return;
+    const cmd = cmdOf(m);
+    panel.querySelector("pre").textContent = cmd;
+    panel.querySelector("[data-copy]").dataset.copy = cmd;
+    const flip = panel.querySelector("[data-flip-host]");
+    if (flip && next) flip.textContent = flipHostText(next);
+  });
+}
+
+function bindMountButtons(scope) {
   scope.querySelectorAll("[data-copy]").forEach((b) =>
     b.addEventListener("click", () => copy(b.dataset.copy, b))
+  );
+  scope.querySelectorAll("[data-flip-host]").forEach((b) =>
+    b.addEventListener("click", () => {
+      useAltHost = !useAltHost;
+      refreshMountCommands();
+    })
   );
 }
 
@@ -462,13 +502,15 @@ async function load(path = "") {
   document.getElementById("basket").textContent = data.name;
 
   mounts = data.mounts;
+  host = data.host;
+  altHost = data.alt_host;
   mountPanel.innerHTML = mountPanelHtml();
-  bindCopyButtons(mountPanel);
+  bindMountButtons(mountPanel);
   const quick = document.getElementById("copy-mount");
   quick.disabled = false;
   quick.onclick = (e) => {
     const m = pickedMount();
-    if (m) copy(m.command, e.currentTarget);
+    if (m) copy(cmdOf(m), e.currentTarget);
   };
 
   root.innerHTML = listCard(data);

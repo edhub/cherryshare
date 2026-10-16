@@ -106,6 +106,8 @@ e2e:
 
     # 挂载命令从**页面上**拿（mounts 里第一条是 macOS）：那正是对方看到的那一条，
     # 也正是这次要验的一条路——命令行里已经不单打一份了。
+    # 取第一个 `"command"`：`alt_command` 里 `command` 前头是下划线，匹配不上，
+    # 但这也是靠字段顺序（`command` 在 `alt_command` 前面）——换序了得跟着改。
     CMD=$(curl -sf "$W/b/$WID/_api/list" | grep -o '"command":"[^"]*"' | head -1 | sed 's/^"command":"//; s/"$//')
     eval "$CMD"
     MP=$(eval echo "${CMD##* }")        # 展开那行里的 ~
@@ -147,6 +149,10 @@ e2e:
     curl -sf "$W/b/$WID/" >/dev/null || { echo "页面打不开 ✗" >&2; exit 1; }
     curl -sf "$W/b/$WID/_app/app.css" >/dev/null || { echo "页面的样式拿不到 ✗" >&2; exit 1; }
     curl -sf "$W/b/$WID/_api/list" | grep -q '"name"' || { echo "列表 JSON 不对 ✗" >&2; exit 1; }
+    # 挂载说明里两条地址都给：这条请求走的是 127.0.0.1，所以默认那条该是 IP，另一条该是本机名。
+    LJ=$(curl -sf "$W/b/$WID/_api/list")
+    echo "$LJ" | grep -q '"host":{"kind":"ip"' || { echo "默认地址该是来访者用的那个 ✗" >&2; exit 1; }
+    echo "$LJ" | grep -q '"alt_host":{"kind":"name"' || { echo "没给出能换的那条地址 ✗" >&2; exit 1; }
     # 缓存：页面和文件的名字是固定的、没版本号，所以得能问「变了没」。少了条件请求的
     # 支持，浏览器每次都得重下整个文件；活索引那几个 JSON 则一句都不许缓存。
     curl -sI "$W/b/$WID/_app/app.js" | grep -qi "^cache-control: no-cache" ||

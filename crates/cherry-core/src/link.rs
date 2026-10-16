@@ -137,6 +137,25 @@ pub fn candidate_hosts() -> Vec<Host> {
     out
 }
 
+/// 在候选里挑一条跟 `current` 种类不同的：名字配 IP，IP 配名字。
+///
+/// 抽出来是为了能单测——真实的候选列要问网卡，测里造不出来（跟 [`usable_by_flags`] 一个道理）。
+fn other_kind<'a>(current: &Host, candidates: &'a [Host]) -> Option<&'a Host> {
+    candidates.iter().find(|h| {
+        matches!(
+            (h, current),
+            (Host::Name(_), Host::Ip(_)) | (Host::Ip(_), Host::Name(_))
+        )
+    })
+}
+
+/// 网页上「挂载说明」默认跟来访者访问时用的地址走，点切换按钮时换到这一个。
+///
+/// 「哪两条地址是一对」只由 [`candidate_hosts`] 说了算，不在这儿另写一份。
+pub fn alternate_host(current: &Host) -> Option<Host> {
+    other_kind(current, &candidate_hosts()).cloned()
+}
+
 /// 对方那边是什么系统。
 ///
 /// **两个系统都得给，因为对方的机器我们不知道**，而这条链接就是唯一的口子：
@@ -532,5 +551,15 @@ mod tests {
             "不是十六进制"
         );
         assert_eq!(BasketLink::parse_basket_id_hex(""), None);
+    }
+
+    #[test]
+    fn 另一条地址跟当前种类相反() {
+        let name = Host::parse("mbp.local").unwrap();
+        let ip = Host::parse("10.1.2.52").unwrap();
+        let both = [name.clone(), ip.clone()];
+        assert_eq!(other_kind(&name, &both), Some(&ip));
+        assert_eq!(other_kind(&ip, &both), Some(&name));
+        assert_eq!(other_kind(&name, &both[..1]), None, "只有一条就没得换");
     }
 }
