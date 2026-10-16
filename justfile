@@ -115,6 +115,25 @@ e2e:
         exit 1
     }
     if [ -e "$MP/share/link" ]; then echo "符号链接泄漏出来了 ✗" >&2; exit 1; fi
+    # 权限位照实报：挂载点上看到的就是源文件的权限，对方 `cp` 出来才是正常文件。
+    # （0.4.2 之前导出把它报成 0444，`cp -R` 出来的东西全是只读的。）
+    [ "$(stat -f %Lp "$MP/share/big.bin")" = "$(stat -f %Lp "$SRC/big.bin")" ] || {
+        echo "挂载点上报的权限跟源文件不一样 ✗" >&2
+        exit 1
+    }
+    cp "$MP/share/big.bin" "$D/copied.bin"
+    [ "$(stat -f %Lp "$D/copied.bin")" = "$(stat -f %Lp "$SRC/big.bin")" ] || {
+        echo "从挂载点拷出来的文件权限不对 ✗" >&2
+        exit 1
+    }
+    # `ro`：客户端那头就挂成只读，写失败说的也是这件事。
+    mount | grep "$MP " | grep -q "read-only" || { echo "挂载点不是只读的 ✗" >&2; exit 1; }
+    WRITE_ERR=$(touch "$MP/share/x" 2>&1 || true)
+    case "$WRITE_ERR" in
+        *"Read-only file system"*) ;;
+        *) echo "写失败的提示没说是只读 ✗：$WRITE_ERR" >&2; exit 1 ;;
+    esac
+
     A=$(shasum -a 256 "$SRC/big.bin" | cut -d' ' -f1)
     B=$(shasum -a 256 "$MP/share/big.bin" | cut -d' ' -f1)
     [ "$A" = "$B" ] || { echo "字节不一致 ✗" >&2; exit 1; }
@@ -126,6 +145,15 @@ e2e:
     curl -sf "$W/b/$WID/" >/dev/null || { echo "页面打不开 ✗" >&2; exit 1; }
     curl -sf "$W/b/$WID/_app/app.css" >/dev/null || { echo "页面的样式拿不到 ✗" >&2; exit 1; }
     curl -sf "$W/b/$WID/_api/list" | grep -q '"name"' || { echo "列表 JSON 不对 ✗" >&2; exit 1; }
+    # 缓存：页面和文件的名字是固定的、没版本号，所以得能问「变了没」。少了条件请求的
+    # 支持，浏览器每次都得重下整个文件；活索引那几个 JSON 则一句都不许缓存。
+    curl -sI "$W/b/$WID/_app/app.js" | grep -qi "^cache-control: no-cache" ||
+        { echo "页面的缓存指令不对 ✗" >&2; exit 1; }
+    LM=$(curl -sI "$W/b/$WID/_app/app.js" | awk 'tolower($1)=="last-modified:"{sub(/\r$/,""); $1=""; sub(/^ /,""); print}')
+    code=$(curl -s -o /dev/null -w '%{http_code}' -H "If-Modified-Since: $LM" "$W/b/$WID/_app/app.js")
+    [ "$code" = "304" ] || { echo "问「变了没」没得到 304，得到 $code ✗" >&2; exit 1; }
+    curl -sI "$W/b/$WID/_api/list" | grep -qi "^cache-control: no-store" ||
+        { echo "活索引的 JSON 不该被缓存 ✗" >&2; exit 1; }
     curl -sf "$W/b/$WID/_api/list?path=share" | grep -q 'big.bin' || { echo "进不了子目录 ✗" >&2; exit 1; }
     C=$(curl -sf "$W/b/$WID/share/big.bin" | shasum -a 256 | cut -d' ' -f1)
     [ "$C" = "$A" ] || { echo "网页上取到的字节跟源不一致 ✗" >&2; exit 1; }
@@ -218,6 +246,7 @@ release version:
     cargo build --release --workspace
     cargo build --release --target x86_64-apple-darwin -p cherry -p cherryd
     cargo zigbuild --release --target x86_64-unknown-linux-musl -p cherry -p cherryd
+    cargo zigbuild --release --target aarch64-unknown-linux-musl -p cherry -p cherryd
     # 网页：静态文件，跟包一起发，但不编进二进制。
     web/build.sh >/dev/null
 
@@ -234,6 +263,7 @@ release version:
     mkdir -p "$DIR/bin/macos-universal" "$DIR/bin/linux-x86_64" "$DIR/bin/linux-aarch64"
     cp "$TMP/cherry" "$TMP/cherryd" "$DIR/bin/macos-universal/"
     cp target/x86_64-unknown-linux-musl/release/cherry target/x86_64-unknown-linux-musl/release/cherryd "$DIR/bin/linux-x86_64/"
+    cp target/aarch64-unknown-linux-musl/release/cherry target/aarch64-unknown-linux-musl/release/cherryd "$DIR/bin/linux-aarch64/"
     cp packaging/install.sh "$DIR/install.sh"
     chmod 755 "$DIR/install.sh"
     cp docs/errors.md "$DIR/errors.md"
@@ -247,35 +277,5 @@ release version:
             install.sh README.md errors.md $(find web -type f) >SHA256SUMS &&
         shasum -a 256 -c SHA256SUMS >/dev/null &&
         echo "$(wc -l <SHA256SUMS | tr -d ' ') 个文件的校验和都对上了")
-    cargo zigbuild --release --target aarch64-unknown-linux-musl -p cherry -p cherryd
 
     printf '\n包好了：%s\n  commit %s，版本 %s\n\n放进篮子：\n  cherry add <篮子名> %s\n' "$DIR" "$COMMIT" "$V" "$DIR"
-    # 缓存：页面和文件的名字是固定的、没版本号，所以得能问「变了没」。少了条件请求的
-    # 支持，浏览器每次都得重下整个文件；活索引那几个 JSON 则一句都不许缓存。
-    curl -sI "$W/b/$WID/_app/app.js" | grep -qi "^cache-control: no-cache" ||
-        { echo "页面的缓存指令不对 ✗" >&2; exit 1; }
-    LM=$(curl -sI "$W/b/$WID/_app/app.js" | awk 'tolower($1)=="last-modified:"{sub(/\r$/,""); $1=""; sub(/^ /,""); print}')
-    code=$(curl -s -o /dev/null -w '%{http_code}' -H "If-Modified-Since: $LM" "$W/b/$WID/_app/app.js")
-    [ "$code" = "304" ] || { echo "问「变了没」没得到 304，得到 $code ✗" >&2; exit 1; }
-    curl -sI "$W/b/$WID/_api/list" | grep -qi "^cache-control: no-store" ||
-        { echo "活索引的 JSON 不该被缓存 ✗" >&2; exit 1; }
-    # 权限位照实报：挂载点上看到的就是源文件的权限，对方 `cp` 出来才是正常文件。
-    # （0.4.2 之前导出把它报成 0444，`cp -R` 出来的东西全是只读的。）
-    [ "$(stat -f %Lp "$MP/share/big.bin")" = "$(stat -f %Lp "$SRC/big.bin")" ] || {
-        echo "挂载点上报的权限跟源文件不一样 ✗" >&2
-        exit 1
-    cp target/aarch64-unknown-linux-musl/release/cherry target/aarch64-unknown-linux-musl/release/cherryd "$DIR/bin/linux-aarch64/"
-    }
-    cp "$MP/share/big.bin" "$D/copied.bin"
-    [ "$(stat -f %Lp "$D/copied.bin")" = "$(stat -f %Lp "$SRC/big.bin")" ] || {
-        echo "从挂载点拷出来的文件权限不对 ✗" >&2
-        exit 1
-    }
-    # `ro`：客户端那头就挂成只读，写失败说的也是这件事。
-    mount | grep "$MP " | grep -q "read-only" || { echo "挂载点不是只读的 ✗" >&2; exit 1; }
-    WRITE_ERR=$(touch "$MP/share/x" 2>&1 || true)
-    case "$WRITE_ERR" in
-        *"Read-only file system"*) ;;
-        *) echo "写失败的提示没说是只读 ✗：$WRITE_ERR" >&2; exit 1 ;;
-    esac
-
