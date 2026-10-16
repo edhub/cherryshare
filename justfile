@@ -91,6 +91,13 @@ e2e:
         "http://"*":20480/b/$WID/") ;;
         *) echo "cherry list 打的不是一条能用的网页链接 ✗: $LINK" >&2; exit 1 ;;
     esac
+    # `--ip` 是降级那条：地址段得是个 IP，而不是本机名。
+    IP_LINK=$(cherry list --ip | awk '{print $2}')
+    case "$IP_LINK" in
+        "http://"[0-9]*.[0-9]*.[0-9]*.[0-9]*":20480/b/$WID/") ;;
+        *) echo "cherry list --ip 打的不是 IP 链接 ✗: $IP_LINK" >&2; exit 1 ;;
+    esac
+    echo "降级那条 $IP_LINK"
 
     # 挂载命令从**页面上**拿（mounts 里第一条是 macOS）：那正是对方看到的那一条，
     # 也正是这次要验的一条路——命令行里已经不单打一份了。

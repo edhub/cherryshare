@@ -183,18 +183,28 @@ impl Service {
             .context("这个 basket 不在我这儿")
     }
 
-    /// 本机这个 basket 的链接。`host` 不给就自己挑一个（见 [`crate::link::lan_addr`]）。
+    /// 本机这个 basket 的链接。
+    ///
+    /// 默认用本机名：大多数时候分享的人和对方在同一个网段，名字就够用，而且比 IP 稳——
+    /// 这边换了 DHCP 地址链接还成立（ADR-0002）。名字是组播解析，跨网段的对方认不了，
+    /// 那种时候用 `prefer_ip` 退到本机 IP（见 [`crate::link::lan_addr`]）；`host` 是
+    /// 对方自己指定地址，给了就用它。
     ///
     /// "填哪个地址"只有这里判一次，不让每个客户端各自判一遍（ADR-0003）。
-    pub async fn link(&self, basket: &str, host: Option<Host>) -> Result<BasketLink> {
+    pub async fn link(
+        &self,
+        basket: &str,
+        host: Option<Host>,
+        prefer_ip: bool,
+    ) -> Result<BasketLink> {
         let b = self.basket(basket).await?;
-        // 默认用本机名：链接是给同一个局域网里的人用的，而名字比 IP 稳——那边换了
-        // DHCP 地址，链接还成立（ADR-0002）。名字是组播解析，过不了路由和隧道，
-        // 走别处的对方要用 IP，那就显式给。
-        // 拿不到本机名（少见）就只能回退到 IP。
-        let host = match host {
-            Some(h) => h,
-            None => crate::link::local_hostname().unwrap_or(Host::Ip(crate::link::lan_addr()?)),
+        let host = match (host, prefer_ip) {
+            (Some(h), _) => h,
+            (None, true) => Host::Ip(crate::link::lan_addr()?),
+            // 拿不到本机名（少见）就只能回退到 IP。
+            (None, false) => {
+                crate::link::local_hostname().unwrap_or(Host::Ip(crate::link::lan_addr()?))
+            }
         };
         Ok(BasketLink::new(host, b.id))
     }
@@ -334,6 +344,32 @@ mod tests {
         b.cherries.push(引用("x", "/etc/hosts/deeper"));
         assert_eq!(prune_basket(&mut b), 0);
         assert_eq!(b.cherries.len(), 1, "不该摘掉");
+    }
+
+    /// 默认用本机名，`--ip` 才退到地址；显式给了地址就听他的（ADR-0002）。
+    #[tokio::test]
+    async fn 链接默认用名字_ip_是降级() {
+        let data = std::env::temp_dir().join(format!("cherry-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data);
+        let svc = Service::start(data.clone()).await.unwrap();
+        svc.create_basket("t").await.unwrap();
+
+        // 显式给的地址压过 `--ip`。
+        let 给的 = Host::Ip("10.0.0.1".parse().unwrap());
+        let forced = svc.link("t", Some(给的.clone()), true).await.unwrap();
+        assert_eq!(forced.host, 给的);
+
+        // 本机没有对外地址的机器（容器之类）上，`--ip` 本来就该报错，那就没得测。
+        let Ok(ip) = crate::link::lan_addr() else {
+            return;
+        };
+        let 退到 = svc.link("t", None, true).await.unwrap();
+        assert_eq!(退到.host, Host::Ip(ip));
+        // 默认那条是名字。（本机名拿不到的机器上，默认会退回 IP，那种机器上这条就不比了。）
+        if let Some(name) = crate::link::local_hostname() {
+            let 默认 = svc.link("t", None, false).await.unwrap();
+            assert_eq!(默认.host, name);
+        }
     }
 
     /// 源没了：报出去的篮子里就不该再有它，而且磁盘上也得落下来（不然重起又回来了）。

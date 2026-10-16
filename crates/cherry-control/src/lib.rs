@@ -46,10 +46,12 @@ pub enum Request {
         basket: String,
         name: String,
     },
-    /// 每个篮子一条网页链接。`host` 不给就用本机名（ADR-0002）；挂载命令不在这儿给，
-    /// 它在页面上，而且是按对方自己的系统给的。
+    /// 每个篮子一条网页链接。`host` 不给就用本机名，`prefer_ip` 是要退到本机 IP
+    /// （名字是组播解析，跨网段的对方认不了）。挂载命令不在这儿给，它在页面上，
+    /// 而且是按对方自己的系统给的（ADR-0002）。
     Links {
         host: Option<String>,
+        prefer_ip: bool,
     },
 }
 
@@ -211,7 +213,7 @@ async fn dispatch_inner(svc: &Service, req: &Request) -> Result<Response> {
             svc.remove_cherry(basket, name).await?;
             Ok(Response::Basket(view(&svc.basket(basket).await?)))
         }
-        Request::Links { host } => {
+        Request::Links { host, prefer_ip } => {
             let host = match host.as_deref() {
                 Some(h) => Some(Host::parse(h)?),
                 None => None,
@@ -226,7 +228,7 @@ async fn dispatch_inner(svc: &Service, req: &Request) -> Result<Response> {
             let mut out = Vec::with_capacity(names.len());
             for name in names {
                 out.push(LinkView {
-                    link: svc.link(&name, host.clone()).await?.to_string(),
+                    link: svc.link(&name, host.clone(), *prefer_ip).await?.to_string(),
                     name,
                 });
             }

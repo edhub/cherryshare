@@ -172,7 +172,7 @@ async fn list_json(
     // 挂载命令里的主机用对方访问时用的那个：他要是从 IP 进来的，给他名字没意义。
     let link = match request_host(headers) {
         Some(h) => BasketLink::new(h, basket.id),
-        None => match app.svc.link(&basket.name, None).await {
+        None => match app.svc.link(&basket.name, None, false).await {
             Ok(l) => l,
             Err(e) => {
                 return plain(

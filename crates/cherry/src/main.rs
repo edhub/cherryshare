@@ -31,10 +31,12 @@ enum Cmd {
     Status,
     /// 列出本机所有 basket，每个连同它的网页链接
     List {
-        /// 链接里填哪个地址。不给我就用本机名（`mbpmax.local` 这种，只在同一个局域网里
-        /// 解析得了）；对方走路由或隧道时显式给一个 IP
-        #[arg(long)]
+        /// 链接里填哪个地址；不给我就用本机名（只在同一个局域网里解析得了），对方走路由或隧道时显式给一个 IP
+        #[arg(long, conflicts_with = "ip")]
         host: Option<String>,
+        /// 链接里填本机 IP。名字是组播解析，跨网段的对方认不了，那时用这个
+        #[arg(long)]
+        ip: bool,
     },
     /// 建一个 basket，你可以往 basket 中添加你想要共享的文件、文件夹
     New {
@@ -98,7 +100,10 @@ async fn main() -> Result<()> {
 fn to_request(cmd: Cmd) -> Result<Request> {
     Ok(match cmd {
         Cmd::Status => Request::Status,
-        Cmd::List { host } => Request::Links { host },
+        Cmd::List { host, ip } => Request::Links {
+            host,
+            prefer_ip: ip,
+        },
         Cmd::New { name } => Request::CreateBasket { name },
         Cmd::Show { basket } => match basket {
             Some(name) => Request::ShowBasket { name },
@@ -218,7 +223,24 @@ mod tests {
 
         // 链接里填哪个地址只影响 `cherry list` 打出来的那条 URL。
         let cli = Cli::try_parse_from(["cherry", "list", "--host", "10.0.0.1"]).unwrap();
-        assert!(matches!(cli.cmd, Some(Cmd::List { host: Some(_) })));
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::List {
+                host: Some(_),
+                ip: false
+            })
+        ));
+
+        // IP 是降级方案：名字跨网段不通的时候显式要。两个一起给是矛盾的，报错。
+        let cli = Cli::try_parse_from(["cherry", "list", "--ip"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::List {
+                host: None,
+                ip: true
+            })
+        ));
+        assert!(Cli::try_parse_from(["cherry", "list", "--ip", "--host", "10.0.0.1"]).is_err());
     }
 
     /// 链接并进 `list` 之后，`cherry link` 就没了（挂载命令在页面上，按对方的系统给）。
