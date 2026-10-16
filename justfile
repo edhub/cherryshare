@@ -231,7 +231,7 @@ release version:
     done
 
     rm -rf "$DIR"
-    mkdir -p "$DIR/bin/macos-universal" "$DIR/bin/linux-x86_64"
+    mkdir -p "$DIR/bin/macos-universal" "$DIR/bin/linux-x86_64" "$DIR/bin/linux-aarch64"
     cp "$TMP/cherry" "$TMP/cherryd" "$DIR/bin/macos-universal/"
     cp target/x86_64-unknown-linux-musl/release/cherry target/x86_64-unknown-linux-musl/release/cherryd "$DIR/bin/linux-x86_64/"
     cp packaging/install.sh "$DIR/install.sh"
@@ -243,9 +243,11 @@ release version:
         packaging/README.md >"$DIR/README.md"
 
     (cd "$DIR" &&
-        shasum -a 256 bin/macos-universal/* bin/linux-x86_64/* install.sh README.md errors.md $(find web -type f) >SHA256SUMS &&
+        shasum -a 256 bin/macos-universal/* bin/linux-x86_64/* bin/linux-aarch64/* \
+            install.sh README.md errors.md $(find web -type f) >SHA256SUMS &&
         shasum -a 256 -c SHA256SUMS >/dev/null &&
         echo "$(wc -l <SHA256SUMS | tr -d ' ') 个文件的校验和都对上了")
+    cargo zigbuild --release --target aarch64-unknown-linux-musl -p cherry -p cherryd
 
     printf '\n包好了：%s\n  commit %s，版本 %s\n\n放进篮子：\n  cherry add <篮子名> %s\n' "$DIR" "$COMMIT" "$V" "$DIR"
     # 缓存：页面和文件的名字是固定的、没版本号，所以得能问「变了没」。少了条件请求的
@@ -262,6 +264,7 @@ release version:
     [ "$(stat -f %Lp "$MP/share/big.bin")" = "$(stat -f %Lp "$SRC/big.bin")" ] || {
         echo "挂载点上报的权限跟源文件不一样 ✗" >&2
         exit 1
+    cp target/aarch64-unknown-linux-musl/release/cherry target/aarch64-unknown-linux-musl/release/cherryd "$DIR/bin/linux-aarch64/"
     }
     cp "$MP/share/big.bin" "$D/copied.bin"
     [ "$(stat -f %Lp "$D/copied.bin")" = "$(stat -f %Lp "$SRC/big.bin")" ] || {

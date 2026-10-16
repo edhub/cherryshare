@@ -48,14 +48,17 @@ OS=$(uname -s)
 ARCH=$(uname -m)
 case "$OS" in
 Darwin) BIN_SRC="$HERE/bin/macos-universal" ;;
-Linux) BIN_SRC="$HERE/bin/linux-x86_64" ;;
+Linux)
+    case "$ARCH" in
+    x86_64 | amd64) BIN_SRC="$HERE/bin/linux-x86_64" ;;
+    aarch64 | arm64) BIN_SRC="$HERE/bin/linux-aarch64" ;;
+    *) die "这份包里的 Linux 二进制有 x86_64 和 aarch64 两种，你这台是 ${ARCH}。" ;;
+    esac
+    ;;
 *) die "$OS 还没做（现在只有 macOS 和 Linux）。" ;;
 esac
 [ -d "$BIN_SRC" ] ||
     die "找不到 $BIN_SRC —— 这个脚本得跟 bin/ 放在一起（也就是它自己所在的那个文件夹）。"
-if [ "$OS" = Linux ] && [ "$ARCH" != x86_64 ]; then
-    die "这份包里的 Linux 二进制是 x86_64 的，你这台是 ${ARCH}。"
-fi
 
 # ---- 取消常驻 ----
 

@@ -343,7 +343,9 @@ fn with_mtime(o: SimpleFileOptions, mtime: Option<u64>) -> SimpleFileOptions {
 /// 对方解开时看到该是文件原来那个「墙上的时间」，不是 UTC。zip 那个格式只到 1980~2107，
 /// 超出范围（或者 stat 不出来）就放弃，让它落到默认值。
 fn zip_time(secs: u64) -> Option<zip::DateTime> {
-    let t = secs as libc::time_t;
+    // 类型靠 `localtime_r` 的签名推出来，不写 `libc::time_t`——那个别名在 musl 1.2 之后
+    // 被标了 deprecated（32 位还是 32 位、64 位才是 64 位），写出来就吃一条警告。
+    let t = secs as _;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     // `localtime_r` 把结果写进我们给的 tm 里，不返回任何共享状态。
     if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {

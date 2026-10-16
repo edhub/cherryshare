@@ -32,7 +32,8 @@ macOS 上挂载不用 sudo，Linux 上要 root（命令见下面「Linux 上挂�
 不想让它常驻就自己拷（两个都要）：
 
     cp bin/macos-universal/cherry bin/macos-universal/cherryd ~/.local/bin/    # macOS
-    cp bin/linux-x86_64/cherry bin/linux-x86_64/cherryd ~/.local/bin/          # Linux
+    cp bin/linux-x86_64/cherry bin/linux-x86_64/cherryd ~/.local/bin/          # Linux x86_64
+    cp bin/linux-aarch64/cherry bin/linux-aarch64/cherryd ~/.local/bin/        # Linux arm64
 
 `~/.local/bin` 不在 PATH 里的话，往 `~/.zshrc`（或 `~/.bashrc`）加一行：
 
@@ -127,7 +128,8 @@ Ctrl-C 停）。然后：
   编出来，两个切片 `lipo` 合到一起之后重做了 ad-hoc 签名。Apple Silicon 上要 macOS 11
   以上，Intel 上要 10.12 以上；但 **Intel 那个切片只做了签名校验，没在真的 Intel 机器上
   跑过**。
-- `bin/linux-x86_64/` —— Linux x86_64，`cargo zigbuild` 编的静态二进制（musl）。
+- `bin/linux-x86_64/`、`bin/linux-aarch64/` —— Linux 的两种架构，`cargo zigbuild` 编的
+  静态二进制（musl）。`install.sh` 按 `uname -m` 挑（0.4.3 起有 arm64）。
   **没在 Linux 上跑过**。
 - `install.sh` —— 上面那个安装脚本。macOS 那一支跑过（装、取消、杀掉让它重起都试了）；
   Linux 那一支没跑过。
