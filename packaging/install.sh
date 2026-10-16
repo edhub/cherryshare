@@ -94,9 +94,15 @@ say "二进制放好了：$BIN_DIR/cherry、$BIN_DIR/cherryd"
 # 缺了不会静默：起不来页面时日志里有、HTTP 那边也会说一句。
 WEB_SRC="$HERE/web"
 if [ -d "$WEB_SRC" ]; then
-    rm -rf "$WEB_DIR"
+    # 这个包常常是直接从只读挂载点上装起来的，而导出那头报的权限就是只读的
+    # （文件 0444、目录 0555），`cp -R` 会把这些模式一并带过来。两件事都得防：
+    # 删之前先把写位加回来（不然装过一次之后下一次就删不掉了），放好之后再按我们
+    # 自己的模式摆一遍（不然拷出来的网页文件是只读的，下次还是删不掉）。
+    [ -d "$WEB_DIR" ] && chmod -R u+w "$WEB_DIR" 2>/dev/null
+    rm -rf "$WEB_DIR" || die "删不掉 $WEB_DIR —— 先 chmod -R u+w 一下再跑"
     mkdir -p "$WEB_DIR"
     cp -R "$WEB_SRC/." "$WEB_DIR/"
+    chmod -R u=rwX,go=rX "$WEB_DIR"
     say "网页放好了：$WEB_DIR"
 else
     say "包里没有 web/，网页这条路用不了（挂载和命令行不受影响）。"

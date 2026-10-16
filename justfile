@@ -29,9 +29,12 @@ install: web
     cargo build --release --workspace
     mkdir -p "$HOME/.local/bin"
     cp target/release/cherry target/release/cherryd "$HOME/.local/bin/"
+    # 上一次要是用 packaging/install.sh 从只读挂载点装的，这里会删不掉（那些文件带着只读位）。
+    chmod -R u+w "$HOME/.local/share/cherryshare/web" 2>/dev/null || true
     rm -rf "$HOME/.local/share/cherryshare/web"
     mkdir -p "$HOME/.local/share/cherryshare/web"
     cp -R {{justfile_directory()}}/web/dist/. "$HOME/.local/share/cherryshare/web/"
+    chmod -R u=rwX,go=rX "$HOME/.local/share/cherryshare/web"
     if launchctl print "gui/$(id -u)/com.cherryshare.cherryd" >/dev/null 2>&1; then launchctl kickstart -k "gui/$(id -u)/com.cherryshare.cherryd"; echo "服务已重启到这一份"; elif [ -f "$HOME/Library/LaunchAgents/com.cherryshare.cherryd.plist" ]; then launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.cherryshare.cherryd.plist" && echo "服务之前没在跑（大概是为了跑 e2e 停掉的），重新拉起来了"; else echo "服务没装着（跑 bash packaging/install.sh 装一个）"; fi
 
 # 编网页的静态文件（web/dist/）。产物不编进二进制，装的时候拷过去。
