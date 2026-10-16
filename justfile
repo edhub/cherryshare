@@ -248,3 +248,12 @@ release version:
         echo "$(wc -l <SHA256SUMS | tr -d ' ') 个文件的校验和都对上了")
 
     printf '\n包好了：%s\n  commit %s，版本 %s\n\n放进篮子：\n  cherry add <篮子名> %s\n' "$DIR" "$COMMIT" "$V" "$DIR"
+    # 缓存：页面和文件的名字是固定的、没版本号，所以得能问「变了没」。少了条件请求的
+    # 支持，浏览器每次都得重下整个文件；活索引那几个 JSON 则一句都不许缓存。
+    curl -sI "$W/b/$WID/_app/app.js" | grep -qi "^cache-control: no-cache" ||
+        { echo "页面的缓存指令不对 ✗" >&2; exit 1; }
+    LM=$(curl -sI "$W/b/$WID/_app/app.js" | awk 'tolower($1)=="last-modified:"{sub(/\r$/,""); $1=""; sub(/^ /,""); print}')
+    code=$(curl -s -o /dev/null -w '%{http_code}' -H "If-Modified-Since: $LM" "$W/b/$WID/_app/app.js")
+    [ "$code" = "304" ] || { echo "问「变了没」没得到 304，得到 $code ✗" >&2; exit 1; }
+    curl -sI "$W/b/$WID/_api/list" | grep -qi "^cache-control: no-store" ||
+        { echo "活索引的 JSON 不该被缓存 ✗" >&2; exit 1; }

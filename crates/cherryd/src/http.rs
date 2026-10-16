@@ -47,6 +47,11 @@ use cherry_core::{Basket, CherryKind, Service};
 
 use crate::tree;
 
+/// 名字固定、没有版本号，所以每次都得回来问一声（`cache` 那个函数里说了为什么）。
+const NO_CACHE: &str = "no-cache";
+/// 活索引，缓不得。
+const NO_STORE: &str = "no-store";
+
 /// 同时最多打几个包。见模块头上的说明。
 const MAX_PACKS: usize = 2;
 /// 同时最多算几个目录的大小。页面进一层就会对每个子目录问一次（只问看得见的），
@@ -100,13 +105,14 @@ async fn page(
     State(app): State<App>,
     Path(id): Path<String>,
     Query(query): Query<Params>,
+    headers: HeaderMap,
     method: Method,
 ) -> Response {
     let Some(basket) = lookup(&app, &id).await else {
         return no_such_basket();
     };
     match query.dl.as_deref() {
-        None => web_file(&app, "index.html", None, false).await,
+        None => web_file(&app, "index.html", &headers, None, false).await,
         Some("zip") => zip_dir(&app, &basket, "", method == Method::HEAD).await,
         Some(other) => plain(
             StatusCode::BAD_REQUEST,
@@ -132,11 +138,11 @@ async fn any(
     match rest.split_once('/').unwrap_or((rest.as_str(), "")) {
         ("_api", "list") => list_json(&app, &basket, &headers, query.path).await,
         ("_api", "size") => size_json(&app, &basket, query.path).await,
-        (seg, _) if seg.starts_with('_') => web_file(&app, &rest, range, head).await,
+        (seg, _) if seg.starts_with('_') => web_file(&app, &rest, &headers, range, head).await,
         // 打包不是「另一个产品」，只是同一个目录的另一种拿法；参数写错要说出来，
         // 不能当没看见然后给人一个目录 404。
         _ => match query.dl.as_deref() {
-            None => serve_file(&basket, &rest, range, head).await,
+            None => serve_file(&basket, &rest, &headers, range, head).await,
             Some("zip") => zip_dir(&app, &basket, &rest, head).await,
             Some(other) => plain(
                 StatusCode::BAD_REQUEST,
@@ -198,7 +204,7 @@ async fn list_json(
         })
         .collect();
 
-    Json(ListJson {
+    let res = Json(ListJson {
         name: basket.name.clone(),
         id: link.basket_id_hex(),
         link: link.to_string(),
@@ -217,7 +223,8 @@ async fn list_json(
             })
             .collect(),
     })
-    .into_response()
+    .into_response();
+    cache(res, NO_STORE)
 }
 
 /// 一个目录总共多大。只 stat 不读内容，而且有预算（见 `tree::size_of`）：跑这个的
@@ -253,7 +260,7 @@ async fn size_json(app: &App, basket: &Basket, sub: Option<String>) -> Response 
             if sz.stop != tree::Stop::Done {
                 tracing::info!(path = %hint, stop = ?sz.stop, entries = sz.files + sz.dirs, "算大小提前停了");
             }
-            Json(sz).into_response()
+            cache(Json(sz).into_response(), NO_STORE)
         }
         Ok(Err(e)) => plain(StatusCode::NOT_FOUND, &format!("算不了：{e:#}")),
         Err(_) => plain(StatusCode::INTERNAL_SERVER_ERROR, "算大小的任务挂了"),
@@ -264,6 +271,7 @@ async fn size_json(app: &App, basket: &Basket, sub: Option<String>) -> Response 
 async fn serve_file(
     basket: &Basket,
     sub: &str,
+    headers: &HeaderMap,
     range: Option<HeaderValue>,
     head: bool,
 ) -> Response {
@@ -271,7 +279,7 @@ async fn serve_file(
     match tokio::task::spawn_blocking(move || listing::resolve(&b, &s)).await {
         // 目录不是文件。网页上要进目录是另一个请求（`_api/list?path=`），
         // 直接 GET 一个目录只可能是手敲 URL，那就说清楚。
-        Ok(Ok((path, meta))) if meta.is_file() => serve_path(&path, range, head).await,
+        Ok(Ok((path, meta))) if meta.is_file() => serve_path(&path, headers, range, head).await,
         Ok(Ok(_)) => plain(StatusCode::NOT_FOUND, "那是个目录，不是文件"),
         // 「不存在」和「非法」给同一个回答：别让人拿状态码探路。
         _ => no_such_file(),
@@ -413,7 +421,13 @@ fn content_disposition(name: &str) -> String {
 }
 
 /// 页面自己的静态文件（`index.html`、`_app/…`）。这是磁盘上的路径，不走篮子的校验。
-async fn web_file(app: &App, rel: &str, range: Option<HeaderValue>, head: bool) -> Response {
+async fn web_file(
+    app: &App,
+    rel: &str,
+    headers: &HeaderMap,
+    range: Option<HeaderValue>,
+    head: bool,
+) -> Response {
     if !app.web.is_dir() {
         return plain(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -425,22 +439,54 @@ async fn web_file(app: &App, rel: &str, range: Option<HeaderValue>, head: bool) 
     if !path.starts_with(app.web.as_path()) || rel.split('/').any(|s| s == "..") {
         return no_such_file();
     }
-    serve_path(&path, range, head).await
+    serve_path(&path, headers, range, head).await
+}
+
+/// 挂一句缓存指令。
+///
+/// 页面和文件用 `no-cache`：名字是固定的、没有版本号，而升级是创建者那边的事，对方
+/// 浏览器里缓存了什么，创建者看不见也刷不了。`no-cache` 意思是「每次回来问一声，没变
+/// 就 304」——没有内容体，局域网里几微秒，升级立刻生效。
+///
+/// `_api/` 那几个 JSON 和出错响应用 `no-store`：那是活索引，缓存下来就是在说谎。
+fn cache(res: Response, how: &'static str) -> Response {
+    let mut res = res;
+    res.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static(how));
+    res
 }
 
 /// 交给 tower-http 的 `ServeFile`：Range、HEAD、Content-Type 它都管。
 ///
 /// 路径必须是**已经校验过**的那个——它自己不认符号链接，也不认识篮子。
-async fn serve_path(path: &PathBuf, range: Option<HeaderValue>, head: bool) -> Response {
+async fn serve_path(
+    path: &PathBuf,
+    headers: &HeaderMap,
+    range: Option<HeaderValue>,
+    head: bool,
+) -> Response {
     let mut send = Request::new(Body::empty());
     if let Some(v) = range {
         send.headers_mut().insert(header::RANGE, v);
+    }
+    // 条件请求的头得原样带给 `ServeFile`：我们只给它一个空 Request，不转发它就等于
+    // 没有（之前只转了 Range）。少了这个，浏览器带着 `If-Modified-Since` 来问，
+    // 我们每次回 200 加整个文件——`no-cache` 之下那等于每次重下。
+    for h in [
+        header::IF_MODIFIED_SINCE,
+        header::IF_UNMODIFIED_SINCE,
+        header::IF_NONE_MATCH,
+        header::IF_RANGE,
+    ] {
+        if let Some(v) = headers.get(&h) {
+            send.headers_mut().insert(h, v.clone());
+        }
     }
     if head {
         *send.method_mut() = Method::HEAD;
     }
     match ServeFile::new(path).oneshot(send).await {
-        Ok(res) => res.map(Body::new),
+        Ok(res) => cache(res.map(Body::new), NO_CACHE),
         Err(_) => plain(StatusCode::INTERNAL_SERVER_ERROR, "读文件失败"),
     }
 }
@@ -468,6 +514,11 @@ fn no_such_file() -> Response {
 
 /// 一句话、能读懂。名字可能带尖括号之类，转义了再放进去。
 fn plain(status: StatusCode, msg: &str) -> Response {
+    // 出错的响应也不许缓存：一条 404 留在浏览器里，等文件真出现了还是 404。
+    cache(plain_inner(status, msg), NO_STORE)
+}
+
+fn plain_inner(status: StatusCode, msg: &str) -> Response {
     let esc = msg
         .replace('&', "&amp;")
         .replace('<', "&lt;")
