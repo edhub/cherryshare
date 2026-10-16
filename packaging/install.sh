@@ -218,7 +218,7 @@ fi
 
 say ""
 say "接着可以："
-say "    cherry list                 本机有哪些篮子"
+say "    cherry list                 本机有哪些篮子（每个带名字和 IP 两条链接）"
 say "    cherry new 我的照片          建一个篮子"
 say "    cherry add 我的照片 <路径>   往里放东西（只是引用，文件不动）"
-say "    cherry list                  每个篮子一行，带那条发给对方的链接"
+say "    cherry list                  每个篮子两条链接：本机名一条、本机 IP 一条"

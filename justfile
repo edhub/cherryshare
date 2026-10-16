@@ -88,17 +88,21 @@ e2e:
 
     WID=$(cherry show t | head -1 | sed 's/.*\[\(.*\)\]/\1/')
     W="http://127.0.0.1:20480"
-    LINK=$(cherry list | awk '{print $2}')
+    # 一个篮子一小段：头上是名字，下面两条链接（名字一条、IP 一条）。
+    URLS=$(cherry list | grep -o 'http://[^ ]*')
+    LINK=$(echo "$URLS" | sed -n 1p)
     echo "链接 $LINK"
     case "$LINK" in
+        "http://"[0-9]*.[0-9]*.[0-9]*.[0-9]*":20480/b/"*)
+            echo "`cherry list` 第一条该是本机名那条，不该是 IP ✗: $LINK" >&2; exit 1 ;;
         "http://"*":20480/b/$WID/") ;;
         *) echo "cherry list 打的不是一条能用的网页链接 ✗: $LINK" >&2; exit 1 ;;
     esac
-    # `--ip` 是降级那条：地址段得是个 IP，而不是本机名。
-    IP_LINK=$(cherry list --ip | awk '{print $2}')
+    # 第二条是降级那条：地址段得是个 IP，而不是本机名。
+    IP_LINK=$(echo "$URLS" | sed -n 2p)
     case "$IP_LINK" in
         "http://"[0-9]*.[0-9]*.[0-9]*.[0-9]*":20480/b/$WID/") ;;
-        *) echo "cherry list --ip 打的不是 IP 链接 ✗: $IP_LINK" >&2; exit 1 ;;
+        *) echo "cherry list 第二条不是 IP 链接 ✗: $IP_LINK" >&2; exit 1 ;;
     esac
     echo "降级那条 $IP_LINK"
 

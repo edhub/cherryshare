@@ -122,6 +122,21 @@ pub fn local_hostname() -> Option<Host> {
     Host::parse(&name).ok()
 }
 
+/// 这台机器能拿出去的地址，按该递给对方的先后来排：本机名在前，局域网 IP 在后。
+///
+/// 两条一起给，因为发送方判不出对方在不在同一个广播域（ADR-0002）：名字过不了路由和
+/// 隧道，IP 这边一换 DHCP 地址就废了。拿不到的就不放进来——容器里常常没有局域网地址。
+pub fn candidate_hosts() -> Vec<Host> {
+    let mut out = Vec::new();
+    if let Some(name) = local_hostname() {
+        out.push(name);
+    }
+    if let Ok(ip) = lan_addr() {
+        out.push(Host::Ip(ip));
+    }
+    out
+}
+
 /// 对方那边是什么系统。
 ///
 /// **两个系统都得给，因为对方的机器我们不知道**，而这条链接就是唯一的口子：
@@ -235,11 +250,8 @@ impl BasketLink {
 /// （VPN 隧道就是点对点的）。然后在这个集合里，如果内核的默认出口地址也在里面，
 /// 就用它——那是内核的意见，而且已经被筛子验证过；不在就用第一个私网地址。
 ///
-/// 已知不完美：虚拟机的网桥接口也可能有私网 IPv4 且能广播，会混进候选。真挑错了，
-/// 还能用 `cherry list --host <ip>` 显式指定。
-///
-/// 只在**拿不到本机名**的时候才用得上（见 [crate::service::Service::link]）：默认走名字，
-/// 名字比 IP 稳（ADR-0002）。
+/// 已知不完美：虚拟机的网桥接口也可能有私网 IPv4 且能广播，会混进候选。挑错了也不致命：
+/// `cherry list` 把名字和 IP 两条一起给人，对方挑能用的那条（[candidate_hosts]）。
 pub fn lan_addr() -> Result<IpAddr> {
     let mut candidates = broadcast_ipv4s();
     if candidates.is_empty() {

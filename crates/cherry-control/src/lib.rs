@@ -17,7 +17,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
 use cherry_core::Service;
-use cherry_core::link::Host;
 
 const SOCKET_FILE: &str = "cherryd.sock";
 
@@ -46,13 +45,10 @@ pub enum Request {
         basket: String,
         name: String,
     },
-    /// 每个篮子一条网页链接。`host` 不给就用本机名，`prefer_ip` 是要退到本机 IP
-    /// （名字是组播解析，跨网段的对方认不了）。挂载命令不在这儿给，它在页面上，
+    /// 每个篮子每个地址一条网页链接——本机名一条，IP 一条（见
+    /// `cherry_core::Service::links`）。挂载命令不在这儿给，它在页面上，
     /// 而且是按对方自己的系统给的（ADR-0002）。
-    Links {
-        host: Option<String>,
-        prefer_ip: bool,
-    },
+    Links,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,7 +65,7 @@ pub enum Response {
     },
     Baskets(Vec<BasketView>),
     Basket(BasketView),
-    Links(Vec<LinkView>),
+    Links(Vec<LinkSet>),
     Error(String),
 }
 
@@ -80,14 +76,16 @@ pub struct BasketView {
     pub cherries: Vec<CherryView>,
 }
 
-/// 一条链接，和它是哪个篮子的。
+/// 一个篮子和它能发出去的几条链接。
 ///
-/// 链接里没有篮子名（它就是一个凭证，见 ADR-0002），所以列好几个的时候得把名字带上
-/// 才知道哪条是哪条。
+/// 链接里没有篮子名（它就是一个凭证，见 ADR-0002），所以列好几个篮子的时候得把名字带上
+/// 才知道哪条是哪条。`links` 按该递给对方的先后来排：本机名在前，IP 在后。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LinkView {
+pub struct LinkSet {
     pub name: String,
-    pub link: String,
+    /// 篮子里有几颗 cherry。列篮子的时候顺带让人看出它是不是空的。
+    pub items: usize,
+    pub links: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,23 +211,19 @@ async fn dispatch_inner(svc: &Service, req: &Request) -> Result<Response> {
             svc.remove_cherry(basket, name).await?;
             Ok(Response::Basket(view(&svc.basket(basket).await?)))
         }
-        Request::Links { host, prefer_ip } => {
-            let host = match host.as_deref() {
-                Some(h) => Some(Host::parse(h)?),
-                None => None,
-            };
-            // 名字从 list_baskets 拿：链接本身没有篮子名（地址里只有 id）。
-            let names: Vec<String> = svc
-                .list_baskets()
-                .await
-                .iter()
-                .map(|b| b.name.clone())
-                .collect();
-            let mut out = Vec::with_capacity(names.len());
-            for name in names {
-                out.push(LinkView {
-                    link: svc.link(&name, host.clone(), *prefer_ip).await?.to_string(),
-                    name,
+        Request::Links => {
+            let mut out = Vec::new();
+            // `list_baskets` 会顺手摘掉源已经没了的引用，所以数出来的是现在的真相。
+            for b in svc.list_baskets().await {
+                out.push(LinkSet {
+                    items: b.cherries.len(),
+                    links: svc
+                        .links(&b.name)
+                        .await?
+                        .into_iter()
+                        .map(|l| l.to_string())
+                        .collect(),
+                    name: b.name,
                 });
             }
             Ok(Response::Links(out))

@@ -17,10 +17,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use tokio::sync::RwLock;
 
-use crate::{
-    basket::Basket,
-    link::{BasketLink, Host},
-};
+use crate::{basket::Basket, link::BasketLink};
 
 #[derive(Clone)]
 pub struct Service {
@@ -183,29 +180,32 @@ impl Service {
             .context("这个 basket 不在我这儿")
     }
 
-    /// 本机这个 basket 的链接。
+    /// 这个 basket 能发出去的几条链接，顺序就是 [`crate::link::candidate_hosts`] 给的
+    /// 顺序：本机名在前，IP 在后。
     ///
-    /// 默认用本机名：大多数时候分享的人和对方在同一个网段，名字就够用，而且比 IP 稳——
-    /// 这边换了 DHCP 地址链接还成立（ADR-0002）。名字是组播解析，跨网段的对方认不了，
-    /// 那种时候用 `prefer_ip` 退到本机 IP（见 [`crate::link::lan_addr`]）；`host` 是
-    /// 对方自己指定地址，给了就用它。
+    /// 两条都给，因为发送方判不出对方在不在同一个广播域，挑哪条是对方那边的事
+    /// （ADR-0002）。只有一条都算不出来的机器上才报错。
     ///
     /// "填哪个地址"只有这里判一次，不让每个客户端各自判一遍（ADR-0003）。
-    pub async fn link(
-        &self,
-        basket: &str,
-        host: Option<Host>,
-        prefer_ip: bool,
-    ) -> Result<BasketLink> {
+    pub async fn links(&self, basket: &str) -> Result<Vec<BasketLink>> {
         let b = self.basket(basket).await?;
-        let host = match (host, prefer_ip) {
-            (Some(h), _) => h,
-            (None, true) => Host::Ip(crate::link::lan_addr()?),
-            // 拿不到本机名（少见）就只能回退到 IP。
-            (None, false) => {
-                crate::link::local_hostname().unwrap_or(Host::Ip(crate::link::lan_addr()?))
-            }
-        };
+        let hosts = crate::link::candidate_hosts();
+        if hosts.is_empty() {
+            bail!("这台机器上既没有本机名，也没有可用的局域网地址");
+        }
+        Ok(hosts
+            .into_iter()
+            .map(|host| BasketLink::new(host, b.id))
+            .collect())
+    }
+
+    /// 默认那一条：本机名优先，拿不到就退到 IP。网页那边没拿到 Host 头时用它。
+    pub async fn link(&self, basket: &str) -> Result<BasketLink> {
+        let b = self.basket(basket).await?;
+        let host = crate::link::candidate_hosts()
+            .into_iter()
+            .next()
+            .context("这台机器上既没有本机名，也没有可用的局域网地址")?;
         Ok(BasketLink::new(host, b.id))
     }
 
@@ -319,6 +319,7 @@ fn prune_basket(basket: &mut Basket) -> usize {
 mod tests {
     use super::*;
     use crate::basket::{Cherry, CherryKind};
+    use crate::link::Host;
 
     fn 引用(name: &str, source: &str) -> Cherry {
         Cherry {
@@ -346,30 +347,25 @@ mod tests {
         assert_eq!(b.cherries.len(), 1, "不该摘掉");
     }
 
-    /// 默认用本机名，`--ip` 才退到地址；显式给了地址就听他的（ADR-0002）。
+    /// 名字那条和 IP 那条都得在，而且是名字在前（ADR-0002）。
     #[tokio::test]
-    async fn 链接默认用名字_ip_是降级() {
+    async fn 链接给名字和_ip_两条() {
         let data = std::env::temp_dir().join(format!("cherry-link-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&data);
         let svc = Service::start(data.clone()).await.unwrap();
         svc.create_basket("t").await.unwrap();
 
-        // 显式给的地址压过 `--ip`。
-        let 给的 = Host::Ip("10.0.0.1".parse().unwrap());
-        let forced = svc.link("t", Some(给的.clone()), true).await.unwrap();
-        assert_eq!(forced.host, 给的);
+        let links = svc.links("t").await.unwrap();
+        assert!(!links.is_empty(), "总得给人一条");
 
-        // 本机没有对外地址的机器（容器之类）上，`--ip` 本来就该报错，那就没得测。
-        let Ok(ip) = crate::link::lan_addr() else {
+        // 本机没有对外地址的机器（容器之类）上就只有名字那条，那就没得比。
+        let (Ok(ip), Some(name)) = (crate::link::lan_addr(), crate::link::local_hostname()) else {
             return;
         };
-        let 退到 = svc.link("t", None, true).await.unwrap();
-        assert_eq!(退到.host, Host::Ip(ip));
-        // 默认那条是名字。（本机名拿不到的机器上，默认会退回 IP，那种机器上这条就不比了。）
-        if let Some(name) = crate::link::local_hostname() {
-            let 默认 = svc.link("t", None, false).await.unwrap();
-            assert_eq!(默认.host, name);
-        }
+        assert_eq!(links[0].host, name, "名字在前");
+        assert_eq!(links[1].host, Host::Ip(ip), "IP 在后");
+        // 默认那条就是第一条。
+        assert_eq!(svc.link("t").await.unwrap().host, name);
     }
 
     /// 源没了：报出去的篮子里就不该再有它，而且磁盘上也得落下来（不然重起又回来了）。

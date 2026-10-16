@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use cherry_control::{BasketView, CherryView, Client, Request, Response};
-use cherry_core::BasketLink;
+use cherry_core::{BasketLink, link::Host};
 use clap::{CommandFactory, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -29,15 +29,8 @@ struct Cli {
 enum Cmd {
     /// 服务状态
     Status,
-    /// 列出本机所有 basket，每个连同它的网页链接
-    List {
-        /// 链接里填哪个地址；不给我就用本机名（只在同一个局域网里解析得了），对方走路由或隧道时显式给一个 IP
-        #[arg(long, conflicts_with = "ip")]
-        host: Option<String>,
-        /// 链接里填本机 IP。名字是组播解析，跨网段的对方认不了，那时用这个
-        #[arg(long)]
-        ip: bool,
-    },
+    /// 列出本机所有 basket，每个都给出要发给对方的网页链接——本机名一条、IP 一条
+    List,
     /// 建一个 basket，你可以往 basket 中添加你想要共享的文件、文件夹
     New {
         /// 篮子名
@@ -100,10 +93,7 @@ async fn main() -> Result<()> {
 fn to_request(cmd: Cmd) -> Result<Request> {
     Ok(match cmd {
         Cmd::Status => Request::Status,
-        Cmd::List { host, ip } => Request::Links {
-            host,
-            prefer_ip: ip,
-        },
+        Cmd::List => Request::Links,
         Cmd::New { name } => Request::CreateBasket { name },
         Cmd::Show { basket } => match basket {
             Some(name) => Request::ShowBasket { name },
@@ -177,21 +167,37 @@ fn print(resp: Response) {
             }
         }
         Response::Basket(b) => print_basket(&b),
-        // 一条篮子一行：名字加那条**要发出去的 URL**。服务给的是链接令牌（篮子 id +
-        // 主机），URL 由它现场拼——这一步跟以前拼挂载命令是同一件事，纯粹是格式。
+        // 一个篮子一小段：头上是名字和里面有几样东西，下面两条链接——本机名一条、IP 一条。
+        // 两条一起摆出来是因为发送方判不出对方在不在同一个广播域（ADR-0002）：名字过不了
+        // 路由和隧道，IP 这边一换 DHCP 地址就废了。URL 由它现场拼，这一步跟以前拼挂载命令
+        // 是同一件事，纯粹是格式。
         // 挂载命令不在这儿打了：页面上有，而且那份是按对方自己的系统给的，比这边猜的准。
         Response::Links(list) => {
             if list.is_empty() {
                 println!("（还没有 basket。用 `cherry new <名字>` 建一个）");
             }
-            for l in &list {
-                match l.link.parse::<BasketLink>() {
-                    Ok(link) => println!("{}  {}", l.name, link.web_url()),
-                    // 解析不了就照原样打出来，别把服务给的东西吞掉。
-                    Err(_) => println!("{}  {}", l.name, l.link),
+            for (i, set) in list.iter().enumerate() {
+                if i > 0 {
+                    println!();
+                }
+                println!("{}（{} 项）", set.name, set.items);
+                for raw in &set.links {
+                    match raw.parse::<BasketLink>() {
+                        Ok(link) => println!("  {}  {}", 地址种类(&link.host), link.web_url()),
+                        // 解析不了就照原样打出来，别把服务给的东西吞掉。
+                        Err(_) => println!("  {raw}"),
+                    }
                 }
             }
         }
+    }
+}
+
+/// 那条链接里的地址是名字还是 IP——两条摆在一起的时候得让人分得出哪条是哪条。
+fn 地址种类(host: &Host) -> &'static str {
+    match host {
+        Host::Name(_) => "本机名",
+        Host::Ip(_) => "本机IP",
     }
 }
 
@@ -217,30 +223,15 @@ mod tests {
     }
 
     #[test]
-    fn show_不带篮子也行_list_收_host() {
+    fn show_不带篮子也行_list_不收地址() {
         let cli = Cli::try_parse_from(["cherry", "show"]).unwrap();
         assert!(matches!(cli.cmd, Some(Cmd::Show { basket: None })));
 
-        // 链接里填哪个地址只影响 `cherry list` 打出来的那条 URL。
-        let cli = Cli::try_parse_from(["cherry", "list", "--host", "10.0.0.1"]).unwrap();
-        assert!(matches!(
-            cli.cmd,
-            Some(Cmd::List {
-                host: Some(_),
-                ip: false
-            })
-        ));
-
-        // IP 是降级方案：名字跨网段不通的时候显式要。两个一起给是矛盾的，报错。
-        let cli = Cli::try_parse_from(["cherry", "list", "--ip"]).unwrap();
-        assert!(matches!(
-            cli.cmd,
-            Some(Cmd::List {
-                host: None,
-                ip: true
-            })
-        ));
-        assert!(Cli::try_parse_from(["cherry", "list", "--ip", "--host", "10.0.0.1"]).is_err());
+        // list 自己把名字和 IP 两条都列出来，不再收地址参数。
+        let cli = Cli::try_parse_from(["cherry", "list"]).unwrap();
+        assert!(matches!(cli.cmd, Some(Cmd::List)));
+        assert!(Cli::try_parse_from(["cherry", "list", "--ip"]).is_err());
+        assert!(Cli::try_parse_from(["cherry", "list", "--host", "10.0.0.1"]).is_err());
     }
 
     /// 链接并进 `list` 之后，`cherry link` 就没了（挂载命令在页面上，按对方的系统给）。
