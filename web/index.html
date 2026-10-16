@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CherryShare</title>
+<!-- 空的 favicon：不写这一行浏览器会去要 /favicon.ico，白一条 404。 -->
+<link rel="icon" href="data:,">
+<!-- 相对路径：页面在 /b/<篮子id>/ 下面，这两个就落到 /b/<篮子id>/_app/… -->
+<link rel="stylesheet" href="_app/app.css">
+</head>
+<body class="min-h-screen bg-base-200">
+<div class="mx-auto max-w-3xl p-4 sm:p-8">
+
+  <header class="flex items-start gap-3">
+    <div class="min-w-0">
+      <h1 class="text-2xl font-semibold truncate">
+        <span class="opacity-70">🍒</span> <span id="basket">…</span>
+      </h1>
+      <p class="text-sm opacity-60 mt-1">CherryShare 分享给你的篮子</p>
+    </div>
+    <!-- 右边两个：一个复制（照来访者的系统挑那一段），一个展开完整说明。 -->
+    <div class="ml-auto flex items-center gap-2 shrink-0">
+      <button id="copy-mount" class="btn btn-primary btn-sm" disabled>复制挂载命令</button>
+      <button id="toggle-mount" class="btn btn-ghost btn-sm" aria-expanded="false" aria-controls="mount-panel">
+        怎么当磁盘用 <span id="chevron">▾</span>
+      </button>
+    </div>
+  </header>
+
+  <div id="mount-panel" class="hidden mt-4"></div>
+
+  <div id="root" class="mt-6 space-y-6"></div>
+
+  <footer class="mt-10 text-xs opacity-60 leading-relaxed">
+    这是只读的。文件一直在对方的机器上——这里给你看的、拿走的就是那一份。
+  </footer>
+</div>
+
+<dialog id="viewer" class="modal">
+  <div class="modal-box max-w-4xl">
+    <form method="dialog">
+      <button class="btn btn-sm btn-circle btn-ghost absolute right-2 top-2" aria-label="关掉">✕</button>
+    </form>
+    <h3 id="viewer-title" class="font-semibold mb-3 pr-8 break-all"></h3>
+    <div id="viewer-body"></div>
+  </div>
+  <form method="dialog" class="modal-backdrop"><button>关掉</button></form>
+</dialog>
+
+<script src="_app/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+{
+  "name": "cherryshare-web",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "@tailwindcss/cli": "^4",
+    "daisyui": "^5",
+    "tailwindcss": "^4"
+  }
+}

@@ -20,6 +20,7 @@ set -eu
 
 LABEL=com.cherryshare.cherryd
 BIN_DIR="$HOME/.local/bin"
+WEB_DIR="$HOME/.local/share/cherryshare/web"
 if [ -n "${CHERRY_INSTALL_HERE:-}" ]; then
     HERE="$CHERRY_INSTALL_HERE"
 else
@@ -85,6 +86,21 @@ for f in cherry cherryd; do
     chmod 755 "$BIN_DIR/$f"
 done
 say "二进制放好了：$BIN_DIR/cherry、$BIN_DIR/cherryd"
+
+# ---- 网页 ----
+#
+# 页面是磁盘上的静态文件，不编进二进制（换页面不用重新出包）。守护进程按
+# `~/.local/share/cherryshare/web` 找它们，所以这里整目录拷过去。
+# 缺了不会静默：起不来页面时日志里有、HTTP 那边也会说一句。
+WEB_SRC="$HERE/web"
+if [ -d "$WEB_SRC" ]; then
+    rm -rf "$WEB_DIR"
+    mkdir -p "$WEB_DIR"
+    cp -R "$WEB_SRC/." "$WEB_DIR/"
+    say "网页放好了：$WEB_DIR"
+else
+    say "包里没有 web/，网页这条路用不了（挂载和命令行不受影响）。"
+fi
 
 case ":$PATH:" in
 *":$BIN_DIR:"*) ;;

@@ -25,32 +25,44 @@ check:
 
 # 从源码编一份装到本机（~/.local/bin），并让服务重启到这一份。
 # 包里的那份走 `bash packaging/install.sh`，不是这条。
-install:
+install: web
     cargo build --release --workspace
     mkdir -p "$HOME/.local/bin"
     cp target/release/cherry target/release/cherryd "$HOME/.local/bin/"
+    rm -rf "$HOME/.local/share/cherryshare/web"
+    mkdir -p "$HOME/.local/share/cherryshare/web"
+    cp -R {{justfile_directory()}}/web/dist/. "$HOME/.local/share/cherryshare/web/"
     if launchctl print "gui/$(id -u)/com.cherryshare.cherryd" >/dev/null 2>&1; then launchctl kickstart -k "gui/$(id -u)/com.cherryshare.cherryd"; echo "服务已重启到这一份"; else echo "服务没装着（跑 bash packaging/install.sh 装一个）"; fi
+
+# 编网页的静态文件（web/dist/）。产物不编进二进制，装的时候拷过去。
+web:
+    "{{justfile_directory()}}/web/build.sh"
 
 # 端到端跑一遍（全程用临时目录，最后自己收拾干净）
 e2e:
     #!/usr/bin/env bash
     set -euo pipefail
-    # 20490 得空着——本机服务在跑就先停掉（launchctl bootout gui/$(id -u)/com.cherryshare.cherryd）。
+    # 20490（NFS）和 20480（网页）都得空着——本机服务在跑就先停掉
+    # （launchctl bootout gui/$(id -u)/com.cherryshare.cherryd）。
     # 二进制用绝对路径：下面有个子 shell 要 cd 进别处去试相对路径。
     CHERRY="{{justfile_directory()}}/target/release/cherry"
     CHERRYD="{{justfile_directory()}}/target/release/cherryd"
+    WEB="{{justfile_directory()}}/web/dist"
     # 每次都编一遍：不然测的可能是个陈年 release 二进制（cargo 自己会判断要不要真编）。
     (cd "{{justfile_directory()}}" && cargo build --release --workspace)
-    if lsof -nP -iTCP:20490 >/dev/null 2>&1; then
-        echo "20490 被占了：先停掉本机的服务（launchctl bootout gui/$(id -u)/com.cherryshare.cherryd）" >&2
-        exit 1
-    fi
+    for port in 20490 20480; do
+        if lsof -nP -iTCP:$port >/dev/null 2>&1; then
+            echo "$port 被占了：先停掉本机的服务（launchctl bootout gui/$(id -u)/com.cherryshare.cherryd）" >&2
+            exit 1
+        fi
+    done
+    [ -f "$WEB/index.html" ] || { echo "网页还没编：先跑 `just web`" >&2; exit 1; }
 
     D=$(mktemp -d)      # 服务的数据目录
     BASE=$(mktemp -d)   # 要分享的东西（下面在它里面建个定名子目录：cherry 的名字取自目录名）
     SRC="$BASE/share"
     mkdir -p "$SRC/sub"
-    CHERRYSHARE_DATA_DIR="$D" "$CHERRYD" >"$D/log" 2>&1 &
+    CHERRYSHARE_DATA_DIR="$D" CHERRYSHARE_WEB_DIR="$WEB" "$CHERRYD" >"$D/log" 2>&1 &
     SVC=$!
     MP=""
     trap 'umount "$MP" 2>/dev/null || true; kill "$SVC" 2>/dev/null || true; rm -rf "$D" "$BASE" "$MP"' EXIT
@@ -86,6 +98,23 @@ e2e:
     [ "$A" = "$B" ] || { echo "字节不一致 ✗" >&2; exit 1; }
     if touch "$MP/share/x" 2>/dev/null; then echo "居然能写 ✗" >&2; exit 1; fi
 
+    # 网页那条路：不挂载也能看和拿。页面、样式、JSON、文件、Range、越界都得对。
+    # （得放在删源之前——篮子空了之后这些就无从验起了。）
+    WID=$(cherry show t | head -1 | sed 's/.*\[\(.*\)\]/\1/')
+    W="http://127.0.0.1:20480"
+    curl -sf "$W/b/$WID/" >/dev/null || { echo "页面打不开 ✗" >&2; exit 1; }
+    curl -sf "$W/b/$WID/_app/app.css" >/dev/null || { echo "页面的样式拿不到 ✗" >&2; exit 1; }
+    curl -sf "$W/b/$WID/_api/list" | grep -q '"name"' || { echo "列表 JSON 不对 ✗" >&2; exit 1; }
+    curl -sf "$W/b/$WID/_api/list?path=share" | grep -q 'big.bin' || { echo "进不了子目录 ✗" >&2; exit 1; }
+    C=$(curl -sf "$W/b/$WID/share/big.bin" | shasum -a 256 | cut -d' ' -f1)
+    [ "$C" = "$A" ] || { echo "网页上取到的字节跟源不一致 ✗" >&2; exit 1; }
+    R=$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -r 0-99 "$W/b/$WID/share/big.bin")
+    [ "$R" = "206 100" ] || { echo "Range 不对 ✗: $R" >&2; exit 1; }
+    for bad in "/" "/b/00000000000000000000000000000000/" "/b/$WID/../../../etc/passwd"; do
+        code=$(curl -s -o /dev/null -w '%{http_code}' "$W$bad")
+        [ "$code" = "404" ] || { echo "该 404 的返回了 $code ✗: $bad" >&2; exit 1; }
+    done
+
     # 源没了：服务把这颗从篮子里摘掉，挂载点根目录照常列（不是整层失败），日志留一条。
     rm -rf "$SRC"
     sleep 6   # 等 actimeo=5 的目录缓存过期
@@ -97,8 +126,7 @@ e2e:
     if cherry show t | grep -q share; then echo "篮子里还留着那颗 ✗" >&2; exit 1; fi
     grep -q "源没了" "$D/log" || { echo "日志里没有那条 ✗" >&2; exit 1; }
 
-    echo "✓ 端到端通过：内容一致、符号链接没出来、写不进去、源没了之后连坐没有发生"
-
+    echo "✓ 端到端通过：内容一致、符号链接没出来、写不进去、源没了之后连坐没有发生、网页那条路通"
 # 出一个版本。参数必须跟 Cargo.toml 里的版本一致。
 release version:
     #!/usr/bin/env bash
@@ -118,6 +146,8 @@ release version:
     cargo build --release --workspace
     cargo build --release --target x86_64-apple-darwin -p cherry -p cherryd
     cargo zigbuild --release --target x86_64-unknown-linux-musl -p cherry -p cherryd
+    # 网页：静态文件，跟包一起发，但不编进二进制。
+    web/build.sh >/dev/null
 
     # lipo 会把链接器给的签名弄没，所以合成之后要重签。
     TMP=$(mktemp -d)
@@ -135,12 +165,14 @@ release version:
     cp packaging/install.sh "$DIR/install.sh"
     chmod 755 "$DIR/install.sh"
     cp docs/errors.md "$DIR/errors.md"
+    mkdir -p "$DIR/web"
+    cp -R web/dist/. "$DIR/web/"
     sed -e "s/__VERSION__/$V/g" -e "s/__COMMIT__/$COMMIT/g" -e "s/__DATE__/$(date +%Y-%m-%d)/g" \
         packaging/README.md >"$DIR/README.md"
 
     (cd "$DIR" &&
-        shasum -a 256 bin/macos-universal/* bin/linux-x86_64/* install.sh README.md errors.md >SHA256SUMS &&
+        shasum -a 256 bin/macos-universal/* bin/linux-x86_64/* install.sh README.md errors.md $(find web -type f) >SHA256SUMS &&
         shasum -a 256 -c SHA256SUMS >/dev/null &&
-        echo "七个文件的校验和都对上了")
+        echo "$(wc -l <SHA256SUMS | tr -d ' ') 个文件的校验和都对上了")
 
     printf '\n包好了：%s\n  commit %s，版本 %s\n\n放进篮子：\n  cherry add <篮子名> %s\n' "$DIR" "$COMMIT" "$V" "$DIR"
