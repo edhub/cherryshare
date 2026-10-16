@@ -154,16 +154,14 @@ impl BasketNfs {
             .map_err(|_| nfsstat3::NFS3ERR_NOENT)
     }
 
-    /// 只读导出，权限位怎么报。
+    /// 篮子根没有磁盘对应物，给它一个普通的目录权限位。
     ///
-    /// **写位一律清掉**，哪怕源文件可写：这个导出不接受写，报可写就是骗客户端。
-    /// **执行位照实报**：一个二进制在挂载点上被报成 `0o444`，对方 `cp` 出来就没有
-    /// 执行位、跑不起来。共享一包可执行文件是正经用例。
-    fn perm(is_dir: bool, exec: bool) -> u32 {
-        if is_dir || exec { 0o555 } else { 0o444 }
-    }
+    /// 写不写得了不靠这个数字：写操作一律报 `NFS3ERR_ROFS`（见下面那一串），挂载命令里
+    /// 也带 `ro`。
+    const ROOT_MODE: u32 = 0o755;
 
-    fn fattr(id: fileid3, is_dir: bool, exec: bool, size: u64, mtime: u64) -> fattr3 {
+    /// `mode` 是**照实报**的源文件权限位，见 [`listing::mode_of`]。
+    fn fattr(id: fileid3, is_dir: bool, mode: u32, size: u64, mtime: u64) -> fattr3 {
         let t = nfstime3 {
             seconds: mtime.min(u32::MAX as u64) as u32,
             nseconds: 0,
@@ -174,7 +172,7 @@ impl BasketNfs {
             } else {
                 ftype3::NF3REG
             },
-            mode: Self::perm(is_dir, exec),
+            mode,
             nlink: 1,
             // uid/gid 一律报 0，不透创建者的身份：这是共享出去的一份只读内容，
             // 不是那台机器延伸出来的文件系统。
@@ -315,13 +313,19 @@ impl NFSFileSystem for BasketNfs {
                 Ok(Self::fattr(
                     id,
                     is_dir,
-                    listing::exec_of(&meta),
+                    listing::mode_of(&meta),
                     if is_dir { 0 } else { meta.len() },
                     listing::mtime_of(&meta),
                 ))
             }
             // 篮子根没有磁盘对应物，但它也有一个真实的时间：篮子定义那个文件的 mtime。
-            None => Ok(Self::fattr(id, true, false, 0, self.svc.baskets_mtime())),
+            None => Ok(Self::fattr(
+                id,
+                true,
+                Self::ROOT_MODE,
+                0,
+                self.svc.baskets_mtime(),
+            )),
         }
     }
 
@@ -392,7 +396,7 @@ impl NFSFileSystem for BasketNfs {
             let attr = Self::fattr(
                 fid,
                 matches!(e.kind, CherryKind::Dir),
-                e.exec,
+                e.mode,
                 e.size,
                 e.mtime,
             );
@@ -565,15 +569,23 @@ mod tests {
     }
 
     #[test]
-    fn 只读但带执行位() {
-        // 目录：能读能进。
-        assert_eq!(BasketNfs::perm(true, false), 0o555);
-        assert_eq!(BasketNfs::perm(true, true), 0o555);
-        // 文件：可读不可写，执行位照实报。
-        assert_eq!(BasketNfs::perm(false, false), 0o444);
-        assert_eq!(BasketNfs::perm(false, true), 0o555);
-        for p in [0o555, 0o444] {
-            assert_eq!(p & 0o222, 0, "写位必须一个都不剩：{p:o}");
-        }
+    fn 权限照实报() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // 磁盘上的文件什么样，报出去就什么样：`cp` 出来才是正常文件。
+        let f = std::env::temp_dir().join(format!("cherry-mode-{}", std::process::id()));
+        std::fs::write(&f, b"x").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let meta = std::fs::metadata(&f).unwrap();
+        assert_eq!(listing::mode_of(&meta), 0o640);
+        std::fs::remove_file(&f).unwrap();
+
+        // 写不写得了不靠这些位：写操作一律 NFS3ERR_ROFS，挂载命令里带 `ro`。
+        assert_eq!(BasketNfs::ROOT_MODE, 0o755);
+        assert_eq!(
+            listing::mode_of(&meta) & 0o111,
+            0,
+            "没有执行位的文件不该报出执行位"
+        );
     }
 }

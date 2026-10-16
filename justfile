@@ -257,3 +257,22 @@ release version:
     [ "$code" = "304" ] || { echo "问「变了没」没得到 304，得到 $code ✗" >&2; exit 1; }
     curl -sI "$W/b/$WID/_api/list" | grep -qi "^cache-control: no-store" ||
         { echo "活索引的 JSON 不该被缓存 ✗" >&2; exit 1; }
+    # 权限位照实报：挂载点上看到的就是源文件的权限，对方 `cp` 出来才是正常文件。
+    # （0.4.2 之前导出把它报成 0444，`cp -R` 出来的东西全是只读的。）
+    [ "$(stat -f %Lp "$MP/share/big.bin")" = "$(stat -f %Lp "$SRC/big.bin")" ] || {
+        echo "挂载点上报的权限跟源文件不一样 ✗" >&2
+        exit 1
+    }
+    cp "$MP/share/big.bin" "$D/copied.bin"
+    [ "$(stat -f %Lp "$D/copied.bin")" = "$(stat -f %Lp "$SRC/big.bin")" ] || {
+        echo "从挂载点拷出来的文件权限不对 ✗" >&2
+        exit 1
+    }
+    # `ro`：客户端那头就挂成只读，写失败说的也是这件事。
+    mount | grep "$MP " | grep -q "read-only" || { echo "挂载点不是只读的 ✗" >&2; exit 1; }
+    WRITE_ERR=$(touch "$MP/share/x" 2>&1 || true)
+    case "$WRITE_ERR" in
+        *"Read-only file system"*) ;;
+        *) echo "写失败的提示没说是只读 ✗：$WRITE_ERR" >&2; exit 1 ;;
+    esac
+

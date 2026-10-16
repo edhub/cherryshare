@@ -417,7 +417,8 @@ function mountPanelHtml() {
         <h2 class="card-title text-base">挂载说明</h2>
         <p class="text-sm opacity-70">
           在终端里粘一行就行，装完就在 <code>${esc(pickedMount()?.mountpoint ?? "")}</code> 下面，
-          跟本地目录一样能用（Finder 里也能看到）。
+          跟本地目录一样能用（Finder 里也能看到）。<strong>挂上的是只读的</strong>：能看、能拷，
+          改不了——要改就先拷到自己那边。
         </p>
         <div role="tablist" class="tabs tabs-lift mt-2">${tabs}</div>
       </div>

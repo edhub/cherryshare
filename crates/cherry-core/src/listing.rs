@@ -26,11 +26,13 @@ pub struct Entry {
     pub size: u64,
     /// Unix 秒。目录也填真实 mtime（见 [`entry`]）。
     pub mtime: u64,
-    /// 源文件带不带执行位。
+    /// 源文件的权限位（低 12 位，含执行位和那几个特殊位）。
     ///
-    /// 报这个是因为对方可能要把文件拷出去跑（共享一包二进制就是这种情况）：只读导出
-    /// 把权限位一律报成 `0o444` 的话，`cp` 出来的东西没有执行位，跑不起来。
-    pub exec: bool,
+    /// **照实报**：这是导出给对方的描述，不是我们自己的策略。写不写得了由服务端拒
+    /// （NFS3ERR_ROFS）和挂载时的 `ro` 决定，跟这个数字无关；而这个数字会被对方机器上的
+    /// `cp`、`rsync -a`、`tar`、Finder 拖拽拿去当**目标文件**的权限——报成 `0o444` 的话，
+    /// 从共享里拷出来的一切都是只读的（连带着目录是 `0o555`，往里面加文件都加不了）。
+    pub mode: u32,
 }
 
 /// 列**一个**目录。`dir` 是篮子内的相对路径，空串表示篮子根（也就是 cherry 列表）。
@@ -176,14 +178,14 @@ fn entry(name: &str, full: &std::path::Path) -> Result<Option<Entry>> {
         // 目录也有 mtime，而且**必须填真的**：NFS 客户端靠它判断目录列表要不要重取，
         // 填 0 就等于「永远不刷新」。
         mtime: mtime_of(&meta),
-        exec: exec_of(&meta),
+        mode: mode_of(&meta),
     }))
 }
 
-/// 源文件带不带执行位。判断只在这一处，列目录和问单个条目都说同一句话。
-pub fn exec_of(meta: &std::fs::Metadata) -> bool {
+/// 源文件的权限位。判断只在这一处，列目录和问单个条目都说同一句话。
+pub fn mode_of(meta: &std::fs::Metadata) -> u32 {
     use std::os::unix::fs::PermissionsExt;
-    meta.permissions().mode() & 0o111 != 0
+    meta.permissions().mode() & 0o7777
 }
 
 pub fn mtime_of(meta: &std::fs::Metadata) -> u64 {

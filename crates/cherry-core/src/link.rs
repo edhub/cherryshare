@@ -207,8 +207,11 @@ impl BasketLink {
             // Linux 上挂载要 root，而 `-t nfs` 是 mount(8) 的用法。
             MountOs::Linux => ("sudo mkdir -p", "sudo mount -t nfs", "nolock"),
         };
+        // `ro`：这个导出只读，客户端挂成只读，往卷里拖东西会出禁止标记、`mount` 里也看得到。
+        // 权限位是照实报的（见 `cherryd::nfs`），所以「只读」这件事由挂载选项和写失败来说，
+        // 不由权限位冒充——冒充的代价是从共享里拷出来的东西全是只读的。
         format!(
-            "{mk} {mountpoint} && {prog} -o {locks},vers=3,tcp,port={port},mountport={port},soft,actimeo=5 {} {mountpoint}",
+            "{mk} {mountpoint} && {prog} -o ro,{locks},vers=3,tcp,port={port},mountport={port},soft,actimeo=5 {} {mountpoint}",
             self.mount_source()
         )
     }
