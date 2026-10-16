@@ -29,8 +29,6 @@ install: web
     cargo build --release --workspace
     mkdir -p "$HOME/.local/bin"
     cp target/release/cherry target/release/cherryd "$HOME/.local/bin/"
-    # 上一次要是用 packaging/install.sh 从只读挂载点装的，这里会删不掉（那些文件带着只读位）。
-    chmod -R u+w "$HOME/.local/share/cherryshare/web" 2>/dev/null || true
     rm -rf "$HOME/.local/share/cherryshare/web"
     mkdir -p "$HOME/.local/share/cherryshare/web"
     cp -R {{justfile_directory()}}/web/dist/. "$HOME/.local/share/cherryshare/web/"

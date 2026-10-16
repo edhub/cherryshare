@@ -83,8 +83,7 @@ fi
 mkdir -p "$BIN_DIR"
 for f in cherry cherryd; do
     [ -f "$BIN_SRC/$f" ] || die "$BIN_SRC/$f 不见了，这个包不完整。"
-    # 先删再拷：0.4.2 及更早的导出把权限位报成只读，那时装下来的文件没有写位，
-    # 直接 cp 盖不上去。
+    # 先删再拷：这份服务可能正跑着（停它在下面），直接 cp 盖上去 Linux 上会 ETXTBSY。
     rm -f "$BIN_DIR/$f"
     cp "$BIN_SRC/$f" "$BIN_DIR/$f"
     chmod 755 "$BIN_DIR/$f"
@@ -98,14 +97,11 @@ say "二进制放好了：$BIN_DIR/cherry、$BIN_DIR/cherryd"
 # 缺了不会静默：起不来页面时日志里有、HTTP 那边也会说一句。
 WEB_SRC="$HERE/web"
 if [ -d "$WEB_SRC" ]; then
-    # 这个包常常是直接从挂载点上装起来的。0.4.2 及更早的导出把权限位报成只读的
-    # （文件 0444、目录 0555），`cp -R` 会把那些模式一并带过来，于是本地这份也是只读的、
-    # 下一次就删不掉了（0.4.3 起导出改成照实报，但旧安装留下的只读目录还得能收拾）。
-    # 所以两件事都做：删之前先把写位加回来，放好之后再按我们自己的模式摆一遍。
-    [ -d "$WEB_DIR" ] && chmod -R u+w "$WEB_DIR" 2>/dev/null
-    rm -rf "$WEB_DIR" || die "删不掉 $WEB_DIR —— 先 chmod -R u+w 一下再跑"
+    rm -rf "$WEB_DIR" || die "删不掉 $WEB_DIR"
     mkdir -p "$WEB_DIR"
     cp -R "$WEB_SRC/." "$WEB_DIR/"
+    # 包里的模式不能照搬：挂载点下来的文件可能是只读的，照搬下去下次就删不掉了。
+    # 装好之后按我们自己的摆一遍。
     chmod -R u=rwX,go=rX "$WEB_DIR"
     say "网页放好了：$WEB_DIR"
 else
