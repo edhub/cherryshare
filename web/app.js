@@ -203,6 +203,8 @@ function watchForSizes(tds) {
 function fillSize(td) {
   askSize(td.dataset.size, (v) => {
     td.innerHTML = sizeCell(v);
+    // 正在按大小排的话，量回来的数得马上算进去——不然顺序跟眼前看到的数字对不上。
+    if (sort.key === "size") sortRows();
   });
 }
 
@@ -219,6 +221,97 @@ function sizeCell(v) {
     return `<span class="opacity-60" title="超过 1 万个文件就不细算了，免得占着对方的电脑">文件太多</span>`;
   }
   return `${size(v.bytes)}<span class="opacity-50 text-xs">（${count(v.files)} 个文件）</span>`;
+}
+
+// ---- 排序 ----
+
+// 排序方式记在一个标签页里：换目录、刷新都还算数，标签页关了就没。跟目录大小一样
+// 放 sessionStorage（见上面 SIZES_KEY）。
+const SORT_STORE = "cherry-sort";
+
+/** 名字按字节序比：跟 `ls`、跟挂载点里列出来的一致（`file10` 排在 `file2` 后面）。 */
+function byName(a, b) {
+  if (a.name < b.name) return -1;
+  return a.name > b.name ? 1 : 0;
+}
+
+/**
+ * 一行拿来排序的大小。文件夹的大小得单独问服务端（`_api/size`，只问看得见的那些），
+ * 问回来的算数；还没问到的按最大算——它们在「大到小」时排在前面，量过的往后让。
+ */
+function sizeOf(entry, dir) {
+  if (entry.kind !== "dir") return entry.size;
+  const got = sizes[dir ? `${dir}/${entry.name}` : entry.name];
+  return got && got.stop === "done" ? got.bytes : Number.POSITIVE_INFINITY;
+}
+
+/** 能点的三列。第一次点给最想先看到的那个方向：名字从 A 头，大小从大到小，改过从新到旧。 */
+const SORT_COLS = {
+  name: { 首点: 1, 比: byName },
+  // 文件夹的大小看 sizeOf：量到的按量到的排，没量到的按最大算。比出来相等就保持原样
+  // （排一次是稳定的），所以还没量到的那些文件夹彼此之间仍是名字序。
+  size: {
+    首点: -1,
+    比: (a, b, dir) => {
+      const x = sizeOf(a, dir);
+      const y = sizeOf(b, dir);
+      return x === y ? 0 : x < y ? -1 : 1;
+    },
+  },
+  mtime: { 首点: -1, 比: (a, b) => a.mtime - b.mtime },
+};
+
+function readSort() {
+  try {
+    const [key, dir] = (sessionStorage.getItem(SORT_STORE) ?? "").split(":");
+    if (SORT_COLS[key]) return { key, dir: Number(dir) < 0 ? -1 : 1 };
+  } catch {
+    // 存不了（隐私模式之类）：那就不记，每次都用默认的。
+  }
+  return null;
+}
+
+let sort = readSort() ?? { key: "name", dir: 1 };
+let rows = [];
+let tbody = null;
+let dirPath = "";
+
+/** 排一次。文件夹永远在前面（跟 Finder 里看到的一样），所以只在同类之间比。 */
+function sortRows() {
+  if (tbody) {
+    const cmp = SORT_COLS[sort.key].比;
+    const 有序 = rows.slice().sort((x, y) => {
+      const 组 = (x.entry.kind === "dir" ? 0 : 1) - (y.entry.kind === "dir" ? 0 : 1);
+      return 组 || cmp(x.entry, y.entry, dirPath) * sort.dir;
+    });
+    const frag = document.createDocumentFragment();
+    for (const r of 有序) frag.append(r.tr);
+    tbody.append(frag);
+  }
+  // 点到哪一列、哪一头，表头上得看得出来。
+  for (const b of document.querySelectorAll("[data-sort]")) {
+    const on = b.dataset.sort === sort.key;
+    b.querySelector(".sort-mark").textContent = on ? (sort.dir > 0 ? "▲" : "▼") : "";
+    b.closest("th").setAttribute(
+      "aria-sort",
+      on ? (sort.dir > 0 ? "ascending" : "descending") : "none",
+    );
+  }
+}
+
+function bindSort() {
+  for (const b of document.querySelectorAll("[data-sort]")) {
+    b.addEventListener("click", () => {
+      const key = b.dataset.sort;
+      sort = sort.key === key ? { key, dir: -sort.dir } : { key, dir: SORT_COLS[key].首点 };
+      try {
+        sessionStorage.setItem(SORT_STORE, `${sort.key}:${sort.dir}`);
+      } catch {
+        // 同上：记不住就记不住。
+      }
+      sortRows();
+    });
+  }
 }
 
 // ---- 列表 ----
@@ -273,19 +366,27 @@ function crumbsOf(data) {
   </div>`;
 }
 
+/** 表头上那个按钮：点一下按这一列排，再点一下翻方向。 */
+function sortHead(key, label) {
+  return `<button type="button" data-sort="${key}"
+    class="inline-flex items-center gap-1 cursor-pointer select-none hover:opacity-70"
+  >${label}<span class="sort-mark text-xs opacity-60"></span></button>`;
+}
+
 function listCard(data) {
-  const rows = data.cherries.map((e) => fileRow(data, e)).join("");
+  const body = data.cherries.map((e) => fileRow(data, e)).join("");
   return `
     <section class="card bg-base-100 shadow-sm">
       <div class="card-body">
         ${crumbsOf(data)}
         <table class="table table-sm">
           <thead><tr>
-            <th>名字</th><th>大小</th>
-            <th class="text-right hidden sm:table-cell">改过</th>
+            <th>${sortHead("name", "名字")}</th>
+            <th>${sortHead("size", "大小")}</th>
+            <th class="text-right hidden sm:table-cell">${sortHead("mtime", "改过")}</th>
             <th></th>
           </tr></thead>
-          <tbody>${rows || `<tr><td colspan="4" class="opacity-60">这里什么都没有。</td></tr>`}</tbody>
+          <tbody>${body || `<tr><td colspan="4" class="opacity-60">这里什么都没有。</td></tr>`}</tbody>
         </table>
       </div>
     </section>`;
@@ -370,6 +471,14 @@ async function load(path = "") {
   };
 
   root.innerHTML = listCard(data);
+  // 行节点留一份：排序是挪这些节点，不是重新生成——已经问回来的大小跟着行一起走。
+  tbody = root.querySelector("tbody");
+  dirPath = data.path;
+  rows = data.cherries.length
+    ? [...tbody.children].map((tr, i) => ({ entry: data.cherries[i], tr }))
+    : [];
+  bindSort();
+  sortRows();
   // 目录行的大小：只问看得见的（一层里几百个目录时，没滚到的没必要算——服务端算一趟
   // 最多花半秒）。命中缓存的那一行会立刻填上。
   watchForSizes([...root.querySelectorAll("[data-size]")]);
