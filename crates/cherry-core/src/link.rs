@@ -12,6 +12,21 @@ use anyhow::{Context, Result, bail};
 /// 但那是启动时的响亮失败，不是静默失败。
 pub const NFS_PORT: u16 = 20490;
 
+/// 网页那条路（第二个入口）用的固定端口。
+///
+/// 跟 NFS 分开：一个是内核协议，一个是给浏览器看的。固定、不进链接，理由同上。
+/// 对方点链接看到的地址形如 `http://<主机>:20480/b/<篮子id>/`。
+pub const HTTP_PORT: u16 = 20480;
+
+/// 网页端口。`CHERRYSHARE_HTTP_PORT` 只是开发、测试时把第二个实例摆到别处用的，
+/// 不是给用户用的（跟 `CHERRYSHARE_DATA_DIR` 一类）。
+pub fn http_port() -> u16 {
+    std::env::var("CHERRYSHARE_HTTP_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(HTTP_PORT)
+}
+
 /// 分享的单位就是一个 link。
 ///
 /// 文本形态是 `cherryshare:<地址>:<32 位十六进制>`。自己发明这个格式（不再借
@@ -154,6 +169,28 @@ impl BasketLink {
     /// 挂载命令里的 `server:/path`。
     pub fn mount_source(&self) -> String {
         format!("{}:/{}", self.host, self.basket_id_hex())
+    }
+
+    /// macOS 的挂载点。两个系统各自拼自己的父目录，但“叫什么”只此一处。
+    pub fn macos_mountpoint(&self, basket_name: &str) -> String {
+        format!("~/cherry/{}", self.mountpoint_leaf(basket_name))
+    }
+
+    /// Linux 的挂载点。
+    pub fn linux_mountpoint(&self, basket_name: &str) -> String {
+        format!("/mnt/{}", self.mountpoint_leaf(basket_name))
+    }
+
+    /// 网页地址：对方点这个就能看、能下，不用挂。
+    ///
+    /// 端口得写出来（HTTP_PORT 不是 80）。凭证就是路径里那一段 id。
+    pub fn web_url(&self) -> String {
+        format!(
+            "http://{}:{}/b/{}/",
+            self.host,
+            http_port(),
+            self.basket_id_hex()
+        )
     }
 
     /// 对方要粘的那一行命令（`mkdir` 和挂载串在一起，粘一次就行）。

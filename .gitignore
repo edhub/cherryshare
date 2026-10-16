@@ -1,3 +1,10 @@
 target/
 .DS_Store
 .pi/
+
+# 网页：依赖和构建产物都不进仓库（`just web` 现编），但 bun.lock 要进。
+web/node_modules/
+web/dist/
+
+# playwright-cli 的临时快照
+.playwright-cli/

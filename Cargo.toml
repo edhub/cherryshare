@@ -41,5 +41,10 @@ getrandom = "0.2"
 nfsserve = "0.11"
 async-trait = "0.1"
 
+# 网页那条路（第二个入口：不挂载也能看和拿）。页面是磁盘上的静态文件，不嵌进二进制。
+axum = "0.8"
+tower-http = { version = "0.6", features = ["fs"] }
+tower = { version = "0.5", features = ["util"] }
+
 cherry-core = { path = "crates/cherry-core" }
 cherry-control = { path = "crates/cherry-control" }

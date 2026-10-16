@@ -33,6 +33,7 @@ struct Inner {
     baskets: RwLock<Vec<Basket>>,
     /// NFS 导出那个监听起来了没有。`cherryd` 绑好（或绑失败）之后告诉服务。
     nfs_up: AtomicBool,
+    http_up: AtomicBool,
 }
 
 impl std::fmt::Debug for Service {
@@ -56,6 +57,7 @@ impl Service {
                 data_dir,
                 baskets: RwLock::new(baskets),
                 nfs_up: AtomicBool::new(false),
+                http_up: AtomicBool::new(false),
             }),
         })
     }
@@ -73,6 +75,15 @@ impl Service {
 
     pub fn nfs_up(&self) -> bool {
         self.inner.nfs_up.load(Ordering::Relaxed)
+    }
+
+    pub fn set_http_up(&self, up: bool) {
+        self.inner.http_up.store(up, Ordering::Relaxed);
+    }
+
+    /// 网页那个监听起没起来。
+    pub fn http_up(&self) -> bool {
+        self.inner.http_up.load(Ordering::Relaxed)
     }
 
     pub async fn create_basket(&self, name: &str) -> Result<Basket> {
@@ -236,6 +247,21 @@ pub fn default_data_dir() -> Result<PathBuf> {
     }
     let base = dirs::data_dir().context("找不到系统数据目录")?;
     Ok(base.join("cherryshare"))
+}
+
+/// 网页文件放在哪儿。
+///
+/// 跟数据目录分开：那边是**状态**（baskets.json、socket），这边是随包一起装的静态文件，
+/// 换页面不该碰到状态。位置跟着二进制走（`~/.local/`，跟 install.sh 装二进制的地方同源），
+/// 所以 `CHERRYSHARE_WEB_DIR` 只是开发时指到仓库里构建产物的旋钮，不是给用户用的。
+pub fn default_web_dir() -> Result<PathBuf> {
+    if let Ok(d) = std::env::var("CHERRYSHARE_WEB_DIR")
+        && !d.is_empty()
+    {
+        return Ok(PathBuf::from(d));
+    }
+    let home = dirs::home_dir().context("找不到家目录")?;
+    Ok(home.join(".local/share/cherryshare/web"))
 }
 
 fn load_baskets(data_dir: &Path) -> Result<Vec<Basket>> {

@@ -61,6 +61,9 @@ pub enum Response {
         /// NFS 导出的端口。`nfs_up` 为假说明那个监听没起来（端口被占之类）。
         nfs_port: u16,
         nfs_up: bool,
+        /// 网页那条路的端口。`http_up` 为假说明页面点不开。
+        http_port: u16,
+        http_up: bool,
     },
     Baskets(Vec<BasketView>),
     Basket(BasketView),
@@ -189,6 +192,8 @@ async fn dispatch_inner(svc: &Service, req: &Request) -> Result<Response> {
             data_dir: svc.data_dir().to_path_buf(),
             nfs_port: cherry_core::link::NFS_PORT,
             nfs_up: svc.nfs_up(),
+            http_port: cherry_core::link::http_port(),
+            http_up: svc.http_up(),
         }),
         Request::ListBaskets => Ok(Response::Baskets(
             svc.list_baskets().await.iter().map(view).collect(),

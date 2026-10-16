@@ -149,6 +149,8 @@ fn print(resp: Response, detail: bool) {
             data_dir,
             nfs_port,
             nfs_up,
+            http_port,
+            http_up,
         } => {
             println!("data       {}", data_dir.display());
             println!("baskets    {baskets}");
@@ -159,6 +161,14 @@ fn print(resp: Response, detail: bool) {
                     ""
                 } else {
                     "（没起来：局域网挂载这条路不可用）"
+                }
+            );
+            println!(
+                "web        {http_port}  {}",
+                if http_up {
+                    ""
+                } else {
+                    "（没起来：链接点不开）"
                 }
             );
         }
@@ -213,21 +223,17 @@ fn print_link(l: &LinkView) {
     if let Ok(link) = l.link.parse::<BasketLink>() {
         println!();
         for (os, name, mnt) in [
-            (
-                MountOs::Macos,
-                "macOS",
-                format!("~/cherry/{}", link.mountpoint_leaf(&l.name)),
-            ),
-            (
-                MountOs::Linux,
-                "Linux",
-                format!("/mnt/{}", link.mountpoint_leaf(&l.name)),
-            ),
+            (MountOs::Macos, "macOS", link.macos_mountpoint(&l.name)),
+            (MountOs::Linux, "Linux", link.linux_mountpoint(&l.name)),
         ] {
             println!("  {name}");
             println!("    {}", link.mount_command(os, &mnt));
             println!("    卸掉：{}", BasketLink::unmount_command(os, &mnt));
         }
+        // 不想当磁盘用的时候走这条：点开就在浏览器里看、能下载，什么都不用装。
+        println!();
+        println!("不想挂载，就让他点这个（浏览器里看和下载）：");
+        println!("  {}", link.web_url());
     }
 }
 

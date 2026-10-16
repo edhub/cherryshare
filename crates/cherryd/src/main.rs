@@ -14,6 +14,7 @@ use cherry_core::Service;
 use clap::Parser;
 use tokio::net::UnixListener;
 
+mod http;
 mod nfs;
 
 #[derive(Debug, Parser)]
@@ -96,6 +97,20 @@ async fn run() -> Result<()> {
         }
     };
 
+    // 网页那条路：给对方一个能看、能点着下载的页面（第二个入口，不挂载也能用）。
+    // 跟 NFS 一样，端口被占不算致命，但绝不能静默。
+    let web_dir = cherry_core::service::default_web_dir()?;
+    let http = match http::bind(cherry_core::link::http_port()).await {
+        Ok(l) => {
+            svc.set_http_up(true);
+            Some(l)
+        }
+        Err(cause) => {
+            tracing::error!("网页起不来（{cause}）：链接点不开");
+            None
+        }
+    };
+
     println!("cherryd");
     println!("  data       {}", data_dir.display());
     println!("  socket     {}", sock.display());
@@ -103,11 +118,20 @@ async fn run() -> Result<()> {
         Some(_) => println!("  nfs        0.0.0.0:{}", cherry_core::link::NFS_PORT),
         None => println!("  nfs        没起来（局域网挂载这条路不可用）"),
     }
+    match &http {
+        Some(_) => println!(
+            "  web        0.0.0.0:{}   {}",
+            cherry_core::link::http_port(),
+            web_dir.display()
+        ),
+        None => println!("  web        没起来（链接点不开）"),
+    }
     println!("  等待中（Ctrl-C 退出）");
 
     tokio::select! {
         r = cherry_control::serve(listener, svc.clone()) => r?,
         r = nfs_forever(nfs) => r?,
+        r = http_forever(http, svc.clone(), web_dir) => r?,
         _ = tokio::signal::ctrl_c() => println!("收到 Ctrl-C，收摊"),
     }
 
@@ -122,6 +146,18 @@ async fn nfs_forever(
     use nfsserve::tcp::NFSTcp;
     match l {
         Some(l) => l.handle_forever().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// 同上。网页那个监听已经绑好了，这里只是把它跑起来。
+async fn http_forever(
+    l: Option<tokio::net::TcpListener>,
+    svc: Service,
+    web_dir: PathBuf,
+) -> Result<()> {
+    match l {
+        Some(l) => http::serve(l, svc, web_dir).await,
         None => std::future::pending().await,
     }
 }
