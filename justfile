@@ -73,7 +73,9 @@ e2e:
     cherry() { CHERRYSHARE_DATA_DIR="$D" "$CHERRY" "$@"; }
 
     head -c 200000 /dev/urandom >"$SRC/big.bin"
+    head -c 50000 /dev/urandom >"$SRC/photo.png"   # 名字是 png，内容不可压：该被原样存
     echo hi >"$SRC/sub/a.txt"
+    mkdir -p "$SRC/emptydir"                        # 空目录也得留得住
     ln -s "$SRC/sub/a.txt" "$SRC/link"   # 符号链接不该被共享
 
     cherry new t >/dev/null
@@ -124,6 +126,57 @@ e2e:
         [ "$code" = "404" ] || { echo "该 404 的返回了 $code ✗: $bad" >&2; exit 1; }
     done
 
+    # 打包下载：把整个子树打成一个 zip，结构、空目录、字节都得对。
+    curl -sf "$W/b/$WID/share?dl=zip" -o "$D/pack.zip" || { echo "打包下不下来 ✗" >&2; exit 1; }
+    unzip -t "$D/pack.zip" >/dev/null || { echo "打出来的包坏了 ✗" >&2; exit 1; }
+    mkdir -p "$D/unpacked"
+    ditto -x -k "$D/pack.zip" "$D/unpacked" || { echo "解不开 ✗" >&2; exit 1; }
+    diff -r -x link "$SRC" "$D/unpacked/share" >/dev/null || {
+        echo "包里的内容跟源不一致 ✗" >&2
+        diff -r -x link "$SRC" "$D/unpacked/share" | head -5 >&2
+        exit 1
+    }
+    [ -d "$D/unpacked/share/emptydir" ] || { echo "空目录在包里丢了 ✗" >&2; exit 1; }
+    if [ -e "$D/unpacked/share/link" ]; then echo "符号链接混进包里了 ✗" >&2; exit 1; fi
+    P=$(shasum -a 256 "$D/unpacked/share/big.bin" | cut -d' ' -f1)
+    [ "$P" = "$A" ] || { echo "包里的大文件字节不一致 ✗" >&2; exit 1; }
+    # 已经压过的按扩展名原样存（省 CPU），能压的才压。这个判错只会多烧 CPU，不会出错，
+    # 所以要有一条看着它的。
+    unzip -v "$D/pack.zip" | grep "photo.png" | grep -q "Stored" || { echo "png 没按原始存 ✗" >&2; exit 1; }
+    unzip -v "$D/pack.zip" | grep "a.txt" | grep -q "Defl" || { echo "文本没被压 ✗" >&2; exit 1; }
+    # 整篮子：篮子根是一排 cherry，没有外套那层。
+    curl -sf "$W/b/$WID/?dl=zip" -o "$D/all.zip" || { echo "整篮子打不下来 ✗" >&2; exit 1; }
+    unzip -l "$D/all.zip" | grep -q "share/big.bin" || { echo "整篮子里没有那颗 cherry ✗" >&2; exit 1; }
+    # 参数写错、或者对文件要打包，都要明说，不能默默给个别的东西。
+    code=$(curl -s -o /dev/null -w '%{http_code}' "$W/b/$WID/share?dl=tar")
+    [ "$code" = "400" ] || { echo "参数写错该是 400，得到 $code ✗" >&2; exit 1; }
+    code=$(curl -s -o /dev/null -w '%{http_code}' "$W/b/$WID/share/big.bin?dl=zip")
+    [ "$code" = "400" ] || { echo "对文件打包该是 400，得到 $code ✗" >&2; exit 1; }
+    grep -q "打包完了" "$D/log" || { echo "日志里没有打包那条 ✗" >&2; exit 1; }
+
+    # 算大小：只 stat 不读内容，而且有预算。过了一万项就停下说「文件太多」，
+    # 而不是接着走完——这台机器是用户自己的，同一台还在给别人做 NFS。
+    curl -sf "$W/b/$WID/_api/size?path=share" | grep -q '"bytes":250003' || {
+        echo "算出来的大小不对 ✗" >&2
+        exit 1
+    }
+    curl -sf "$W/b/$WID/_api/size?path=share" | grep -q '"stop":"done"' || {
+        echo "这么小的树不该提前停 ✗" >&2
+        exit 1
+    }
+    MANY="$BASE/many"
+    # 一次 mkdir 建一万多个，比建一万个文件便宜。注意数目得**过**一万：正好一万条是
+    # 算得完的，那时报 done 才是对的。
+    mkdir -p "$MANY"/{00001..10050}
+    cherry add t "$MANY" >/dev/null
+    curl -sf "$W/b/$WID/_api/size?path=many" | grep -q '"stop":"too_many"' || {
+        echo "过了一万项该停下 ✗" >&2
+        exit 1
+    }
+    cherry rm t many >/dev/null
+    code=$(curl -s -o /dev/null -w '%{http_code}' "$W/b/$WID/_api/size")
+    [ "$code" = "400" ] || { echo "算大小不给 path 该是 400，得到 $code ✗" >&2; exit 1; }
+
     # 源没了：服务把这颗从篮子里摘掉，挂载点根目录照常列（不是整层失败），日志留一条。
     rm -rf "$SRC"
     sleep 6   # 等 actimeo=5 的目录缓存过期
@@ -135,7 +188,7 @@ e2e:
     if cherry show t | grep -q share; then echo "篮子里还留着那颗 ✗" >&2; exit 1; fi
     grep -q "源没了" "$D/log" || { echo "日志里没有那条 ✗" >&2; exit 1; }
 
-    echo "✓ 端到端通过：内容一致、符号链接没出来、写不进去、源没了之后连坐没有发生、网页那条路通"
+    echo "✓ 端到端通过：内容一致、符号链接没出来、写不进去、源没了之后连坐没有发生、网页那条路通、打包能解开、目录大小算得对且有预算"
 # 出一个版本。参数必须跟 Cargo.toml 里的版本一致。
 release version:
     #!/usr/bin/env bash

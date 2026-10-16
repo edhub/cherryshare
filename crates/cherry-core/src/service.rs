@@ -183,7 +183,7 @@ impl Service {
             .context("这个 basket 不在我这儿")
     }
 
-    /// 本机这个 basket 的链接。`host` 不给就自己挑一个（见 [`crate::link::lan_addrs`]）。
+    /// 本机这个 basket 的链接。`host` 不给就自己挑一个（见 [`crate::link::lan_addr`]）。
     ///
     /// "填哪个地址"只有这里判一次，不让每个客户端各自判一遍（ADR-0003）。
     pub async fn link(&self, basket: &str, host: Option<Host>) -> Result<BasketLink> {
@@ -194,8 +194,7 @@ impl Service {
         // 拿不到本机名（少见）就只能回退到 IP。
         let host = match host {
             Some(h) => h,
-            None => crate::link::local_hostname()
-                .unwrap_or(Host::Ip(crate::link::lan_addrs()?.preferred)),
+            None => crate::link::local_hostname().unwrap_or(Host::Ip(crate::link::lan_addr()?)),
         };
         Ok(BasketLink::new(host, b.id))
     }

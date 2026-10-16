@@ -16,6 +16,7 @@ use tokio::net::UnixListener;
 
 mod http;
 mod nfs;
+mod tree;
 
 #[derive(Debug, Parser)]
 #[command(name = "cherryd", version, about = "CherryShare 的服务")]

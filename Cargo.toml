@@ -45,6 +45,12 @@ async-trait = "0.1"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["fs"] }
 tower = { version = "0.5", features = ["util"] }
+# 打包下载：流式写 zip（`ZipWriter::new_stream` 不需要 Seek）。
+# 只开 flate2 的 zlib-rs 后端：默认那个 `deflate` 会额外拖上 zopfli（很慢），
+# 而且默认后端已经不是 miniz 了。级别选 2 的经过见 docs/performance.md。
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+# 把阻塞线程写的 zip 接给 HTTP 响应体用。
+tokio-util = { version = "0.7", features = ["io", "rt", "io-util"] }
 
 cherry-core = { path = "crates/cherry-core" }
 cherry-control = { path = "crates/cherry-control" }

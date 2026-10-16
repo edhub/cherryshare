@@ -308,6 +308,49 @@ ADR-0003 担心的「文件系统的读是小块、同步的……会慢到不�
 
 **macOS 上“复制一份”可能不花空间。** `reflink_or_copy` 先试 `reflink`，macOS 上就是 `clonefile`（APFS 写时复制）。实测：把一个 256 MiB 文件 `add_path` 进 store，卷只少了 **3 MiB**；`fetch` 下载 256 MiB 再导出到目标，卷只少了 **261 MiB**（真复制该是 512）。**`du` 对 clone 两边各自报满，所以判断空间占用必须看卷的空闲空间（`df -k`）前后差，不能用 `du`。**
 
+## 网页打包下载（zip）的压缩级别 —— 跟上面那轮 iroh 无关
+
+决定「下载整个文件夹」用什么级别时量的。放这儿是因为这份文件是量测的唯一去处。
+单核，flate2 的 `DeflateEncoder`，一次 write_all，release。下面这组是 **miniz_oxide** 后端
+（flate2 的默认）。实际发出去的那份走的是 **zlib-rs**：zip 9 的默认 deflate 已经不是 miniz，
+而且还会拖上 zopfli 那个慢家伙，所以依赖里显式开了 `deflate-flate2-zlib-rs`。
+zlib-rs 在 2 级上是 145 MB/s、压缩率 0.377（跟这组几乎一样），定 2 级的结论不变。
+语料都 32 MiB 上下：文本（源码加 markdown 拼起来）、混合（八成文本 + 一点 Mach-O + 一点 png）、
+媒体（四分之一文本、四分之一 Mach-O、一半随机数——代表已经压过的东西）。
+
+| 级别 | 文本 压缩率/速度 | 混合 | 媒体 | 每 GiB（文本）|
+|---|---|---|---|---|
+| 1 | 0.449 / 178 MB/s | 0.459 / 180 | 0.779 / 232 | 5.9 s |
+| 2 | 0.369 / 136 MB/s | 0.385 / 128 | 0.749 /  68 | 7.6 s |
+| 3 | 0.344 /  96 MB/s | 0.362 /  89 | 0.740 /  61 | 10.8 s |
+| 4 | 0.344 /  85 MB/s | 0.361 /  81 | 0.739 /  60 | 12.2 s |
+| 5 | 0.339 /  69 MB/s | 0.357 /  65 | 0.737 /  55 | 14.8 s |
+| 6 | 0.335 /  46 MB/s | 0.353 /  44 | 0.736 /  47 | 22.3 s |
+| 9 | 0.335 /  31 MB/s | 0.352 /  29 | 0.735 /  45 | 33 s |
+
+- **曲线在 3 级就平了**：3 → 6 少 2.6% 体积、CPU 翻一倍多；L4 跟 L3 体积一模一样。**crate 默认的 6 级是坏账。**
+- **定 2 级**（2026-10-16）。1 → 2 少 18% 体积、CPU 多三成；再往上不值。
+  理由：公司内网带宽不宽裕，省下的字节数算得回来。
+- **媒体占比高的文件夹，2 级只有 68 MB/s**（比千兆网还慢），1 级是 232 MB/s。
+  所以「认出已经压不动的扩展名直接 store」不是可选项——那些东西 1 到 6 级都只差 5.5% 体积，
+  却差五倍 CPU。store 不进 deflate，1 GiB 半秒上下。
+- **store 清单定了**（2026-10-16）：只按扩展名判，不看魔数，认不出的走 2 级 deflate。
+  图片 png jpg jpeg gif webp avif heic heif jxl cr2 cr3 nef arw orf raf rw2；
+  视频 mp4 m4v mov webm mkv avi mpg mpeg m2ts mts wmv flv 3gp ogv；
+  音频 mp3 m4a aac ogg oga opus flac wma ape wv；
+  容器 zip gz tgz bz2 xz zst 7z rar jar war apk ipa xpi crx cbz dmg iso pdf
+  docx xlsm xlsx pptx odt ods odp epub pages numbers keynote sketch；字体 woff woff2。
+  故意不收的：`ts`（多半是 TypeScript，不是 MPEG-TS）、tiff/wav（可能根本没压）、
+  ttf/otf（deflate 能省一半）、dng（可以是未压的 TIFF）。
+- **级别号不可移植**：同一个 6 级，miniz 压到 0.335、zlib-rs 0.341；1 级反而 zlib-rs 差（0.475 对 0.449）。
+  换后端得重新量，不能照搬数字。
+- **遍历本身很便宜**（打包和「算文件夹大小」共用同一套）：`read_dir` + 每个条目一次
+  `symlink_metadata`（不读内容），缓存热时 **12~17 µs/项**。一千个文件 15 毫秒，十万个 1.5 秒。
+  所以这类「现算」的东西慢不慢只看**文件数**，不看字节数；冷缓存要差一个量级（没在本机试过，
+  不能 purge）。这也是为什么它不进列表那条路：NFS 上每次 `ls` 都算子树等于把 `ls` 变慢。
+  页面上的目录大小就这么算：**1 万项或 0.5 秒**先到为准（条目数是主闸，确定性；时间是兜底，
+  对付冷盘和外置盘），超了就说「文件太多」，不再往下走；同时最多算 4 个。
+
 ## 更正过的错误结论
 
 | 说过的 | 实际 |
