@@ -69,7 +69,7 @@ impl Host {
         if s.is_empty() || s.len() > 253 {
             bail!("`{s}` 当主机名太短或太长");
         }
-        // 这串东西会被原样拼进 `cherry link` 打出来的那行挂载命令里，人要拷进 shell 粘。
+        // 这串东西会被原样拼进挂载命令里，人要拷进 shell 粘。
         // 所以字符集卡死：不给引号、分号、空白、斜杠留位置。冒号也不行——链接是按
         // 冒号切的。
         if !s
@@ -222,16 +222,7 @@ impl BasketLink {
     }
 }
 
-/// 链接里该填哪个地址，以及还有哪些备选。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LanAddrs {
-    /// 挑出来的那个。
-    pub preferred: IpAddr,
-    /// 其余候选：让人在对方挂不上的时候换着试（`cherry link --host`）。
-    pub others: Vec<IpAddr>,
-}
-
-/// 挑一个局域网地址。
+/// 挑一个局域网地址——链接里要填的那个。
 ///
 /// **不能只问内核“要去外网走哪张网卡”**——有 VPN 的时候默认路由走隧道，拿到的就是
 /// 隧道地址，而那个地址对方的局域网里到不了（实测：`utun10` 的 172.19.0.1 挂不上，
@@ -241,9 +232,12 @@ pub struct LanAddrs {
 /// （VPN 隧道就是点对点的）。然后在这个集合里，如果内核的默认出口地址也在里面，
 /// 就用它——那是内核的意见，而且已经被筛子验证过；不在就用第一个私网地址。
 ///
-/// 已知不完美：虚拟机的网桥接口也可能有私网 IPv4 且能广播，会混进候选。所以候选
-/// 全部返回，由调用方（`cherry link`）印出来让人换着试。
-pub fn lan_addrs() -> Result<LanAddrs> {
+/// 已知不完美：虚拟机的网桥接口也可能有私网 IPv4 且能广播，会混进候选。真挑错了，
+/// 还能用 `cherry list --host <ip>` 显式指定。
+///
+/// 只在**拿不到本机名**的时候才用得上（见 [crate::service::Service::link]）：默认走名字，
+/// 名字比 IP 稳（ADR-0002）。
+pub fn lan_addr() -> Result<IpAddr> {
     let mut candidates = broadcast_ipv4s();
     if candidates.is_empty() {
         bail!("这台机器上没有可用的局域网地址（没连网？）");
@@ -257,13 +251,11 @@ pub fn lan_addrs() -> Result<LanAddrs> {
         .unwrap_or(0);
 
     let route = route_source_addr();
-    let preferred = match route {
+    Ok(match route {
         // 内核的默认出口地址，得先通过筛子才算数。
         Some(a) if candidates.contains(&a) => a,
         _ => candidates[private_first],
-    };
-    let others = candidates.into_iter().filter(|a| *a != preferred).collect();
-    Ok(LanAddrs { preferred, others })
+    })
 }
 
 /// 按接口标志筛出真正的网卡上的 IPv4 地址。
@@ -453,10 +445,13 @@ mod tests {
     }
 
     #[test]
-    fn 首选不在备选里() {
+    fn 挑出来的地址是干净的() {
         // 没网就是没网，这不是测试失败。
-        if let Ok(a) = lan_addrs() {
-            assert!(!a.others.contains(&a.preferred), "{a:?}");
+        if let Ok(a) = lan_addr() {
+            let IpAddr::V4(v4) = a else {
+                panic!("只该出 IPv4：{a}")
+            };
+            assert!(!v4.is_loopback(), "回环不该被挑出来：{v4}");
         }
     }
 

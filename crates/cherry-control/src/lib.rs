@@ -46,9 +46,9 @@ pub enum Request {
         basket: String,
         name: String,
     },
-    /// 打出分享链接。`basket` 不给就是每个篮子一条，`host` 不给就用本机名（ADR-0002）。
-    Link {
-        basket: Option<String>,
+    /// 每个篮子一条网页链接。`host` 不给就用本机名（ADR-0002）；挂载命令不在这儿给，
+    /// 它在页面上，而且是按对方自己的系统给的。
+    Links {
         host: Option<String>,
     },
 }
@@ -211,21 +211,18 @@ async fn dispatch_inner(svc: &Service, req: &Request) -> Result<Response> {
             svc.remove_cherry(basket, name).await?;
             Ok(Response::Basket(view(&svc.basket(basket).await?)))
         }
-        Request::Link { basket, host } => {
+        Request::Links { host } => {
             let host = match host.as_deref() {
                 Some(h) => Some(Host::parse(h)?),
                 None => None,
             };
-            // 不给篮子就是每个篮子一条。名字从 list_baskets 拿，链接本身没有篮子名。
-            let names: Vec<String> = match basket {
-                Some(name) => vec![name.clone()],
-                None => svc
-                    .list_baskets()
-                    .await
-                    .iter()
-                    .map(|b| b.name.clone())
-                    .collect(),
-            };
+            // 名字从 list_baskets 拿：链接本身没有篮子名（地址里只有 id）。
+            let names: Vec<String> = svc
+                .list_baskets()
+                .await
+                .iter()
+                .map(|b| b.name.clone())
+                .collect();
             let mut out = Vec::with_capacity(names.len());
             for name in names {
                 out.push(LinkView {

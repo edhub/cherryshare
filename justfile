@@ -32,7 +32,7 @@ install: web
     rm -rf "$HOME/.local/share/cherryshare/web"
     mkdir -p "$HOME/.local/share/cherryshare/web"
     cp -R {{justfile_directory()}}/web/dist/. "$HOME/.local/share/cherryshare/web/"
-    if launchctl print "gui/$(id -u)/com.cherryshare.cherryd" >/dev/null 2>&1; then launchctl kickstart -k "gui/$(id -u)/com.cherryshare.cherryd"; echo "服务已重启到这一份"; else echo "服务没装着（跑 bash packaging/install.sh 装一个）"; fi
+    if launchctl print "gui/$(id -u)/com.cherryshare.cherryd" >/dev/null 2>&1; then launchctl kickstart -k "gui/$(id -u)/com.cherryshare.cherryd"; echo "服务已重启到这一份"; elif [ -f "$HOME/Library/LaunchAgents/com.cherryshare.cherryd.plist" ]; then launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.cherryshare.cherryd.plist" && echo "服务之前没在跑（大概是为了跑 e2e 停掉的），重新拉起来了"; else echo "服务没装着（跑 bash packaging/install.sh 装一个）"; fi
 
 # 编网页的静态文件（web/dist/）。产物不编进二进制，装的时候拷过去。
 web:
@@ -42,8 +42,9 @@ web:
 e2e:
     #!/usr/bin/env bash
     set -euo pipefail
-    # 20490（NFS）和 20480（网页）都得空着——本机服务在跑就先停掉
-    # （launchctl bootout gui/$(id -u)/com.cherryshare.cherryd）。
+    # 端口那条检查只看 LISTEN：浏览器留下的 CLOSE_WAIT 连接也算「占用」的话会白报一次。
+    # 停服务是 `launchctl bootout gui/$(id -u)/com.cherryshare.cherryd`；跑完用
+    # `just install`（它会 bootstrap 回来）或 `launchctl bootstrap …` 起回去。
     # 二进制用绝对路径：下面有个子 shell 要 cd 进别处去试相对路径。
     CHERRY="{{justfile_directory()}}/target/release/cherry"
     CHERRYD="{{justfile_directory()}}/target/release/cherryd"
@@ -51,7 +52,8 @@ e2e:
     # 每次都编一遍：不然测的可能是个陈年 release 二进制（cargo 自己会判断要不要真编）。
     (cd "{{justfile_directory()}}" && cargo build --release --workspace)
     for port in 20490 20480; do
-        if lsof -nP -iTCP:$port >/dev/null 2>&1; then
+        # 只看 LISTEN：浏览器留下的 CLOSE_WAIT 连接也算「占用」的话，会白报一次。
+        if lsof -nP -iTCP:$port -sTCP:LISTEN >/dev/null 2>&1; then
             echo "$port 被占了：先停掉本机的服务（launchctl bootout gui/$(id -u)/com.cherryshare.cherryd）" >&2
             exit 1
         fi
@@ -78,11 +80,19 @@ e2e:
     # 特意用相对路径加：客户端得按自己的 cwd 解析（服务那头的 cwd 是 /）。
     (cd "$BASE" && cherry add t ./share) >/dev/null
     cherry show t
-    LINK=$(cherry link t | head -1)
-    echo "链接 $LINK"
 
-    # 就按它打出来的那行命令挂（把 "macOS" 那一段抠出来执行）
-    CMD=$(cherry link t | grep -A1 '^  macOS' | tail -1 | sed 's/^ *//')
+    WID=$(cherry show t | head -1 | sed 's/.*\[\(.*\)\]/\1/')
+    W="http://127.0.0.1:20480"
+    LINK=$(cherry list | awk '{print $2}')
+    echo "链接 $LINK"
+    case "$LINK" in
+        "http://"*":20480/b/$WID/") ;;
+        *) echo "cherry list 打的不是一条能用的网页链接 ✗: $LINK" >&2; exit 1 ;;
+    esac
+
+    # 挂载命令从**页面上**拿（mounts 里第一条是 macOS）：那正是对方看到的那一条，
+    # 也正是这次要验的一条路——命令行里已经不单打一份了。
+    CMD=$(curl -sf "$W/b/$WID/_api/list" | grep -o '"command":"[^"]*"' | head -1 | sed 's/^"command":"//; s/"$//')
     eval "$CMD"
     MP=$(eval echo "${CMD##* }")        # 展开那行里的 ~
     echo "挂在 $MP"
@@ -100,8 +110,7 @@ e2e:
 
     # 网页那条路：不挂载也能看和拿。页面、样式、JSON、文件、Range、越界都得对。
     # （得放在删源之前——篮子空了之后这些就无从验起了。）
-    WID=$(cherry show t | head -1 | sed 's/.*\[\(.*\)\]/\1/')
-    W="http://127.0.0.1:20480"
+    # 注意这里只验接口，页面里的 JS（在线看、大小、缓存那些）是手验的，别以为这条盖住了。
     curl -sf "$W/b/$WID/" >/dev/null || { echo "页面打不开 ✗" >&2; exit 1; }
     curl -sf "$W/b/$WID/_app/app.css" >/dev/null || { echo "页面的样式拿不到 ✗" >&2; exit 1; }
     curl -sf "$W/b/$WID/_api/list" | grep -q '"name"' || { echo "列表 JSON 不对 ✗" >&2; exit 1; }

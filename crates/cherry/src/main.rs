@@ -8,9 +8,8 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use cherry_control::{BasketView, CherryView, Client, LinkView, Request, Response};
+use cherry_control::{BasketView, CherryView, Client, Request, Response};
 use cherry_core::BasketLink;
-use cherry_core::link::MountOs;
 use clap::{CommandFactory, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -30,8 +29,13 @@ struct Cli {
 enum Cmd {
     /// 服务状态
     Status,
-    /// 列出本机所有 basket
-    List,
+    /// 列出本机所有 basket，每个连同它的网页链接
+    List {
+        /// 链接里填哪个地址。不给我就用本机名（`mbpmax.local` 这种，只在同一个局域网里
+        /// 解析得了）；对方走路由或隧道时显式给一个 IP
+        #[arg(long)]
+        host: Option<String>,
+    },
     /// 建一个 basket，你可以往 basket 中添加你想要共享的文件、文件夹
     New {
         /// 篮子名
@@ -55,15 +59,6 @@ enum Cmd {
         basket: String,
         /// cherry 名
         name: String,
-    },
-    /// 打出分享链接（连同对方要用的挂载命令）；不给篮子就每个篮子一条
-    Link {
-        /// 篮子名。不给我就把所有 basket 的链接列出来
-        basket: Option<String>,
-        /// 链接里填哪个地址。不给我就用本机名（`mbpmax.local` 这种，只在同一个局域网
-        /// 里解析得了）；对方走路由或隧道时显式给一个 IP
-        #[arg(long)]
-        host: Option<String>,
     },
 }
 
@@ -89,16 +84,13 @@ async fn main() -> Result<()> {
         return Ok(());
     };
 
-    // “详情还是点名”只有客户端知道（服务端只回数据，ADR-0003）。
-    let detail = matches!(cmd, Cmd::Show { basket: None });
-
     // 数据目录不做成选项：正常用的人就只有默认那一个，摆到帮助里是多余的。要开第二个
     // 实例（e2e）就设 `CHERRYSHARE_DATA_DIR`——`default_data_dir()` 会读。
     let data_dir = cherry_core::service::default_data_dir()?;
     let mut client = Client::connect(&data_dir).await?;
     match client.call(&to_request(cmd)?).await? {
         Response::Error(e) => bail!("{e}"),
-        other => print(other, detail),
+        other => print(other),
     }
     Ok(())
 }
@@ -106,7 +98,7 @@ async fn main() -> Result<()> {
 fn to_request(cmd: Cmd) -> Result<Request> {
     Ok(match cmd {
         Cmd::Status => Request::Status,
-        Cmd::List => Request::ListBaskets,
+        Cmd::List { host } => Request::Links { host },
         Cmd::New { name } => Request::CreateBasket { name },
         Cmd::Show { basket } => match basket {
             Some(name) => Request::ShowBasket { name },
@@ -117,7 +109,6 @@ fn to_request(cmd: Cmd) -> Result<Request> {
             path: absolute(path)?,
         },
         Cmd::Rm { basket, name } => Request::RemoveCherry { basket, name },
-        Cmd::Link { basket, host } => Request::Link { basket, host },
     })
 }
 
@@ -140,8 +131,8 @@ fn absolute(path: PathBuf) -> Result<PathBuf> {
     })
 }
 
-/// `detail`：`cherry list` 只是点名，`cherry show` 不带篮子要的是每个篮子的详情。
-fn print(resp: Response, detail: bool) {
+/// `cherry show` 不带给篮子时也是每颗都给详情——反正它问的就是「里面有什么」。
+fn print(resp: Response) {
     match resp {
         Response::Error(_) => {}
         Response::Status {
@@ -177,28 +168,22 @@ fn print(resp: Response, detail: bool) {
                 println!("（还没有 basket。用 `cherry new <名字>` 建一个）");
             }
             for b in &list {
-                // `cherry list` 只是点名；`cherry show` 不带篮子要的是每个篮子的详情。
-                if detail {
-                    print_basket(b);
-                } else {
-                    println!("{}  ({} 颗)", b.name, b.cherries.len());
-                }
+                print_basket(b);
             }
         }
         Response::Basket(b) => print_basket(&b),
-        // 每个篮子都给整段（挂载命令在里面）。不止一个时先报名字，不然光看链接分不清哪条是哪条。
+        // 一条篮子一行：名字加那条**要发出去的 URL**。服务给的是链接令牌（篮子 id +
+        // 主机），URL 由它现场拼——这一步跟以前拼挂载命令是同一件事，纯粹是格式。
+        // 挂载命令不在这儿打了：页面上有，而且那份是按对方自己的系统给的，比这边猜的准。
         Response::Links(list) => {
             if list.is_empty() {
                 println!("（还没有 basket。用 `cherry new <名字>` 建一个）");
-            } else {
-                for (i, l) in list.iter().enumerate() {
-                    if i > 0 {
-                        println!();
-                    }
-                    if list.len() > 1 {
-                        println!("{}", l.name);
-                    }
-                    print_link(l);
+            }
+            for l in &list {
+                match l.link.parse::<BasketLink>() {
+                    Ok(link) => println!("{}  {}", l.name, link.web_url()),
+                    // 解析不了就照原样打出来，别把服务给的东西吞掉。
+                    Err(_) => println!("{}  {}", l.name, l.link),
                 }
             }
         }
@@ -215,28 +200,6 @@ fn print_basket(b: &BasketView) {
     }
 }
 
-/// 一条链接的完整说明：链接本身、各系统的挂载命令、地址候选。
-fn print_link(l: &LinkView) {
-    println!("{}", l.link);
-    println!();
-    println!("把这条发给对方，在 terminal 中运行即可：");
-    if let Ok(link) = l.link.parse::<BasketLink>() {
-        println!();
-        for (os, name, mnt) in [
-            (MountOs::Macos, "macOS", link.macos_mountpoint(&l.name)),
-            (MountOs::Linux, "Linux", link.linux_mountpoint(&l.name)),
-        ] {
-            println!("  {name}");
-            println!("    {}", link.mount_command(os, &mnt));
-            println!("    卸掉：{}", BasketLink::unmount_command(os, &mnt));
-        }
-        // 不想当磁盘用的时候走这条：点开就在浏览器里看、能下载，什么都不用装。
-        println!();
-        println!("不想挂载，就让他点这个（浏览器里看和下载）：");
-        println!("  {}", link.web_url());
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,18 +212,19 @@ mod tests {
     }
 
     #[test]
-    fn show_和_link_可以不带篮子() {
+    fn show_不带篮子也行_list_收_host() {
         let cli = Cli::try_parse_from(["cherry", "show"]).unwrap();
         assert!(matches!(cli.cmd, Some(Cmd::Show { basket: None })));
 
-        let cli = Cli::try_parse_from(["cherry", "link", "--host", "10.0.0.1"]).unwrap();
-        assert!(matches!(
-            cli.cmd,
-            Some(Cmd::Link {
-                basket: None,
-                host: Some(_)
-            })
-        ));
+        // 链接里填哪个地址只影响 `cherry list` 打出来的那条 URL。
+        let cli = Cli::try_parse_from(["cherry", "list", "--host", "10.0.0.1"]).unwrap();
+        assert!(matches!(cli.cmd, Some(Cmd::List { host: Some(_) })));
+    }
+
+    /// 链接并进 `list` 之后，`cherry link` 就没了（挂载命令在页面上，按对方的系统给）。
+    #[test]
+    fn link_子命令没了() {
+        assert!(Cli::try_parse_from(["cherry", "link"]).is_err());
     }
 
     #[test]
