@@ -64,7 +64,8 @@ Ctrl-C 停）。然后：
 
     cherry list                            # 每个篮子一段：名字和可用地址的网页链接
 
-篮子就是 `~/.config/cherryshare/` 里的一个文件，一行一条路径（`~/` 开头或绝对路径）。
+篮子就是 `~/.config/cherryshare/` 里的一个文件（这个位置跟着 `XDG_CONFIG_HOME`），一行一条路径
+（`~/` 开头或绝对路径）。
 建篮子、加东西、拿走东西都是改这个文件；服务盯着它，存盘就生效，不用重起：
 
     vim ~/.config/cherryshare/我的照片.basket
@@ -126,6 +127,8 @@ Ctrl-C 停）。然后：
 
 ## 会碰到什么
 
+- **篮子里有一行读不进来**：`cherry list` 会把那个文件单独列出来，原因带行号——相对路径、
+  两行最后一段撞名、`id` 写坏或者写了不止一行 `id`。这个文件整个不生效，别的篮子照常。
 - **创建者关掉服务或网络断了**：未缓存的 NFS 读取会等待后报超时。macOS 使用生成的
   `soft` 命令实测约 8 秒，不保证 Linux 一样。先恢复服务和网络再重试，不是重挂就能解决。
 - **创建者服务重启**：macOS 实测通常不用重挂。根句柄仍有效，缓存中的子句柄可能报
@@ -153,13 +156,16 @@ Ctrl-C 停）。然后：
 
 来自 `cherryshare` 仓库的 commit `__COMMIT__`，版本 __VERSION__，__DATE__ 编的。
 
-相对 0.1.0 的主要变化：
+相对 0.4.4 的主要变化：
 
-- **macOS 实测服务重启后通常不用重新挂载。** 0.1.0 的句柄会全部失效；当前根句柄
-  可跨重启解析，子句柄由客户端重新查找，正在读取的文件仍可能报错。
-- 新增网页浏览、预览、单文件和目录 zip 下载；`cherry list` 输出网页链接。
-- `cherry mount` 已删除，挂载命令统一在网页里提供，分别有 macOS 和 Linux 两种。
-- 新增 `install.sh`：安装二进制、网页和常驻服务（LaunchAgent / systemd）。
+- **篮子变成数据目录里的一个文件**：`~/.config/cherryshare/<名字>.basket`。一行一条路径，
+  `id` 那一行是访问凭证。建篮子、加东西、拿走东西都是改这个文件；服务盯着它，存盘就生效，
+  不用重起。删掉文件就是吊销，改掉 `id` 那一行就是换凭证。
+- `cherry new` / `add` / `rm` 已删除，CLI 只剩 `status` / `list` / `show` 三个读命令。
+  `cherry show` 打的是文件原文，并标出哪几行现在读不到。
+- 老的 `baskets.json` 会在服务启动时自动拆成一个个 `.basket` 文件，原文件留成
+  `baskets.json.migrated`。
+- 网页的挂载说明可以在本机名和 IP 两条地址之间切换。
 
 - `bin/macos-universal/` —— macOS 通用二进制（arm64 + x86_64）。`cargo build --release`
   编出来，两个切片 `lipo` 合到一起之后重做了 ad-hoc 签名。Apple Silicon 上要 macOS 11

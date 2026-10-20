@@ -21,7 +21,7 @@ mod tree;
 #[derive(Debug, Parser)]
 #[command(name = "cherryd", version, about = "CherryShare 的服务")]
 struct Args {
-    /// 数据目录。默认取 $CHERRYSHARE_DATA_DIR，再退到系统数据目录。
+    /// 数据目录。默认取 $CHERRYSHARE_DATA_DIR，再退到 ~/.config/cherryshare（跟着 XDG_CONFIG_HOME）。
     #[arg(long, env = "CHERRYSHARE_DATA_DIR")]
     data_dir: Option<PathBuf>,
 }
