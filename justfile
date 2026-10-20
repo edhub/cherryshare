@@ -11,8 +11,8 @@
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-# 包放哪儿。跟 install.sh 无关——那是对方那边的事。
-dist := env_var_or_default("CHERRY_DIST", home_directory() / "Public")
+# 包放哪儿。跟 install.sh 无关——那是对方那边的事。默认在仓库的 dist/ 下（不进仓库）。
+dist := env_var_or_default("CHERRY_DIST", justfile_directory() / "dist")
 
 default:
     @just --list

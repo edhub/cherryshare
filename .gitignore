@@ -6,5 +6,8 @@ target/
 web/node_modules/
 web/dist/
 
+# `just release` 出的包
+dist/
+
 # playwright-cli 的临时快照
 .playwright-cli/
