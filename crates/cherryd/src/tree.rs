@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use cherry_core::{Basket, Node};
 use serde::Serialize;
 use zip::write::SimpleFileOptions;
 use zip::write::StreamWriter;
@@ -72,9 +73,65 @@ impl Sized {
 pub fn size_of(root: &Path) -> Sized {
     let mut acc = Sized::default();
     let started = Instant::now();
-    let mut stack = vec![root.to_path_buf()];
-    let mut ticks: u64 = 0;
+    let mut ticks = 0u64;
+    walk_into(root, &mut acc, started, &mut ticks);
+    acc
+}
 
+/// 走一棵虚拟目录算大小。只统计点名的那几条，中间层是壳，不碰磁盘。
+pub fn size_of_virtual(basket: &Basket, path: &str) -> Sized {
+    let mut acc = Sized::default();
+    let started = Instant::now();
+    let mut ticks = 0u64;
+    if let Some(node) = basket.virtual_node(path) {
+        walk_node(node, &mut acc, started, &mut ticks);
+    }
+    acc
+}
+
+/// 虚拟树的一层。中间的虚拟目录也算一个条目——它也要占预算，不然一个全是空壳的
+/// 篮子能把预算绕过去。
+fn walk_node(node: &Node, acc: &mut Sized, started: Instant, ticks: &mut u64) {
+    for child in node.children.values() {
+        if acc.entries() >= SIZE_MAX_ENTRIES {
+            acc.stop = Stop::TooMany;
+            return;
+        }
+        *ticks += 1;
+        if ticks.is_multiple_of(256) && started.elapsed().as_millis() as u64 >= SIZE_MAX_MILLIS {
+            acc.stop = Stop::TooSlow;
+            return;
+        }
+
+        let Some(source) = &child.source else {
+            acc.dirs += 1;
+            walk_node(child, acc, started, ticks);
+            if acc.stop != Stop::Done {
+                return;
+            }
+            continue;
+        };
+        // 跟真目录同一套判断：只算真文件和真目录，链接跳过。
+        let Ok(meta) = fs::symlink_metadata(source) else {
+            continue;
+        };
+        if meta.is_symlink() {
+            tracing::warn!(path = %source.display(), "符号链接，不算进大小");
+        } else if meta.is_dir() {
+            acc.dirs += 1;
+            walk_into(source, acc, started, ticks);
+            if acc.stop != Stop::Done {
+                return;
+            }
+        } else if meta.is_file() {
+            acc.files += 1;
+            acc.bytes += meta.len();
+        }
+    }
+}
+
+fn walk_into(root: &Path, acc: &mut Sized, started: Instant, ticks: &mut u64) {
+    let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         // 读不出来的目录跳过：算大小不是关键路径，不该因为一个权限问题就把整件事报错。
         let Ok(rd) = fs::read_dir(&dir) else {
@@ -83,14 +140,14 @@ pub fn size_of(root: &Path) -> Sized {
         for de in rd.flatten() {
             if acc.entries() >= SIZE_MAX_ENTRIES {
                 acc.stop = Stop::TooMany;
-                return acc;
+                return;
             }
             // 每 256 项看一眼表：`Instant::now()` 不贵，但也不必每一项都调。
-            ticks += 1;
+            *ticks += 1;
             if ticks.is_multiple_of(256) && started.elapsed().as_millis() as u64 >= SIZE_MAX_MILLIS
             {
                 acc.stop = Stop::TooSlow;
-                return acc;
+                return;
             }
 
             // `file_type()` 在 APFS 上直接读 readdir 给的 d_type，不额外 stat。
@@ -115,7 +172,6 @@ pub fn size_of(root: &Path) -> Sized {
             }
         }
     }
-    acc
 }
 
 /// 这些东西本来就是压过的，deflate 白烧 CPU——实测每档级别的压缩率都是 1.00，1 级偶尔
@@ -176,24 +232,55 @@ pub fn write_zip_dir(root: &Path, wrapper: &str, out: &mut dyn Write) -> Result<
     Ok(acc)
 }
 
-/// 打整个篮子。
-///
-/// 篮子根**不是一个目录**，是一排 cherry 并排（见 ADR-0002），所以这里没有那一层外套：
-/// 每颗 cherry 各自是包根上的一条。
-pub fn write_zip_roots(roots: &[(String, PathBuf)], out: &mut dyn Write) -> Result<Packed> {
+/// 打一个虚拟目录。`path` 是空串时是篮子根（顶层条目并排，没有外套那层），
+/// 否则先套一层同名目录（跟 Finder 的「压缩」一个样）。
+pub fn write_zip_virtual(basket: &Basket, path: &str, out: &mut dyn Write) -> Result<Packed> {
+    let node = basket
+        .virtual_node(path)
+        .with_context(|| format!("`{path}` 不是一个虚拟目录"))?;
     let mut z = ZipWriter::new_stream(out);
     let mut acc = Packed::default();
-    for (name, path) in roots {
-        let Some(meta) = meta_of(path) else {
-            // 引用没了。跳过，日志留一条；文件里那一行不动（ADR-0008）。
-            tracing::warn!(cherry = %name, "源没了，打包跳过");
-            acc.skipped += 1;
-            continue;
-        };
-        add_entry(&mut z, path, name, meta.file_type(), &mut acc)?;
-    }
+    let prefix = if path.is_empty() {
+        String::new()
+    } else {
+        let leaf = path.rsplit('/').next().unwrap_or(path);
+        let wrapper = format!("{leaf}/");
+        z.add_directory(&wrapper, store_options(Some(basket.mtime())))
+            .with_context(|| format!("在 zip 里开目录 `{wrapper}` 失败"))?;
+        wrapper
+    };
+    add_virtual(&mut z, basket, node, &prefix, &mut acc)?;
     z.finish().context("收尾 zip 失败（响应大概已经断了）")?;
     Ok(acc)
+}
+
+fn add_virtual<W: Write>(
+    z: &mut StreamZip<W>,
+    basket: &Basket,
+    node: &Node,
+    prefix: &str,
+    acc: &mut Packed,
+) -> Result<()> {
+    for (name, child) in &node.children {
+        let inside = format!("{prefix}{name}");
+        match &child.source {
+            Some(source) => {
+                let Some(meta) = meta_of(source) else {
+                    // 引用没了。跳过，日志留一条；文件里那一行不动（ADR-0008）。
+                    tracing::warn!(cherry = %inside, "源没了，打包跳过");
+                    acc.skipped += 1;
+                    continue;
+                };
+                add_entry(z, source, &inside, meta.file_type(), acc)?;
+            }
+            None => {
+                z.add_directory(format!("{inside}/"), store_options(Some(basket.mtime())))
+                    .with_context(|| format!("在 zip 里开目录 `{inside}/` 失败"))?;
+                add_virtual(z, basket, child, &format!("{inside}/"), acc)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 一个条目：`inside` 是它在包内的完整名字。
@@ -492,20 +579,102 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// 打整个篮子：篮子根是一排 cherry，没有外套那层。
+    fn basket(dir: &Path, cherries: Vec<cherry_core::Cherry>) -> Basket {
+        Basket::new([0u8; 16], "t".into(), dir.join("t.basket"), cherries).unwrap()
+    }
+
+    /// 打整个篮子：顶层条目并排，没有外套那层。
     #[test]
     fn 打整个篮子时顶层条目并排() {
         let dir = tree("roots");
-        let roots = vec![
-            ("文本.txt".to_owned(), dir.join("文本.txt")),
-            ("子目录".to_owned(), dir.join("子目录")),
-        ];
+        let b = basket(
+            &dir,
+            vec![
+                cherry_core::Cherry {
+                    path: "文本.txt".into(),
+                    source: dir.join("文本.txt"),
+                    line: 1,
+                },
+                cherry_core::Cherry {
+                    path: "子目录".into(),
+                    source: dir.join("子目录"),
+                    line: 2,
+                },
+            ],
+        );
         let mut out = Vec::new();
-        write_zip_roots(&roots, &mut out).unwrap();
+        write_zip_virtual(&b, "", &mut out).unwrap();
         let mut z = zip::ZipArchive::new(Cursor::new(out)).unwrap();
         assert!(z.by_name("文本.txt").is_ok());
         assert!(z.by_name("子目录/空的/").is_ok(), "空目录也在");
         assert!(z.by_name("share/文本.txt").is_err(), "不该有外套那层");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `/./` 的中间层在包里也长成目录；下载那层本身时只套一层外套。
+    #[test]
+    fn 虚拟目录打进包里() {
+        let dir = tree("vzip");
+        let b = basket(
+            &dir,
+            vec![
+                cherry_core::Cherry {
+                    path: "agent/文本.txt".into(),
+                    source: dir.join("文本.txt"),
+                    line: 1,
+                },
+                cherry_core::Cherry {
+                    path: "agent/子目录".into(),
+                    source: dir.join("子目录"),
+                    line: 2,
+                },
+            ],
+        );
+
+        let mut out = Vec::new();
+        write_zip_virtual(&b, "", &mut out).unwrap();
+        let mut z = zip::ZipArchive::new(Cursor::new(out)).unwrap();
+        assert!(z.by_name("agent/文本.txt").is_ok());
+        assert!(z.by_name("agent/子目录/空的/").is_ok());
+
+        let mut out = Vec::new();
+        write_zip_virtual(&b, "agent", &mut out).unwrap();
+        let mut z = zip::ZipArchive::new(Cursor::new(out)).unwrap();
+        assert!(z.by_name("agent/文本.txt").is_ok(), "下载一层只套一层外套");
+        assert!(z.by_name("文本.txt").is_err(), "不该把外套去掉");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 虚拟目录的大小只算点名的子树，中间层不碰磁盘。
+    #[test]
+    fn 虚拟目录的大小只算点名的() {
+        let dir = tree("vsize");
+        let b = basket(
+            &dir,
+            vec![
+                cherry_core::Cherry {
+                    path: "agent/文本.txt".into(),
+                    source: dir.join("文本.txt"),
+                    line: 1,
+                },
+                cherry_core::Cherry {
+                    path: "agent/子目录".into(),
+                    source: dir.join("子目录"),
+                    line: 2,
+                },
+            ],
+        );
+
+        let s = size_of_virtual(&b, "");
+        assert_eq!(s.files, 1);
+        assert_eq!(s.dirs, 3, "agent、子目录和里面那个空的");
+        assert_eq!(s.bytes, 500, "没点名的 png 和 bin 不算");
+
+        let s = size_of_virtual(&b, "agent");
+        assert_eq!(s.files, 1);
+        assert_eq!(s.dirs, 2, "agent 自己不算，跟 size_of 不数 root 一样");
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -129,7 +129,7 @@ impl BasketNfs {
 
     /// 篮子内相对路径 → 磁盘路径**和它的元数据**。
     ///
-    /// 篮子根返回 `None`：它是个虚拟目录（成员是 cherry 本身），磁盘上没有对应物。
+    /// 虚拟目录返回 `None`：篮子根和 `/./` 的中间层磁盘上没有对应物。
     async fn disk_path(
         basket: &Basket,
         sub: &str,
@@ -141,7 +141,11 @@ impl BasketNfs {
         tokio::task::spawn_blocking(move || listing::resolve(&b, &s))
             .await
             .map_err(|_| nfsstat3::NFS3ERR_IO)?
-            .map(Some)
+            // 虚拟目录没有磁盘对应物，跟篮子根一样走 None。
+            .map(|r| match r {
+                listing::Resolved::Disk(path, meta) => Some((path, meta)),
+                listing::Resolved::Virtual => None,
+            })
             // 「路径不存在」和「路径非法」回同一个错：别让人靠错误码探测。
             .map_err(|_| nfsstat3::NFS3ERR_NOENT)
     }
@@ -154,13 +158,9 @@ impl BasketNfs {
             .map_err(|_| nfsstat3::NFS3ERR_NOENT)
     }
 
-    /// 篮子根没有磁盘对应物，给它一个普通的目录权限位。
-    ///
-    /// 写不写得了不靠这个数字：写操作一律报 `NFS3ERR_ROFS`（见下面那一串），挂载命令里
-    /// 也带 `ro`。
-    const ROOT_MODE: u32 = 0o755;
-
-    /// `mode` 是**照实报**的源文件权限位，见 [`listing::mode_of`]。
+    /// `mode` 是**照实报**的源文件权限位，见 [`listing::mode_of`]；虚拟目录用
+    /// [`listing::VIRTUAL_MODE`]。写不写得了不靠这些位：写操作一律报 `NFS3ERR_ROFS`，
+    /// 挂载命令里也带 `ro`。
     fn fattr(id: fileid3, is_dir: bool, mode: u32, size: u64, mtime: u64) -> fattr3 {
         let t = nfstime3 {
             seconds: mtime.min(u32::MAX as u64) as u32,
@@ -318,8 +318,15 @@ impl NFSFileSystem for BasketNfs {
                     listing::mtime_of(&meta),
                 ))
             }
-            // 篮子根没有磁盘对应物，但它也有一个真实的时间：定义它的那个文件的 mtime。
-            None => Ok(Self::fattr(id, true, Self::ROOT_MODE, 0, basket.mtime())),
+            // 虚拟目录（篮子根或 `/./` 的中间层）没有磁盘对应物，但它也有一个真实的时间：
+            // 定义它的那个文件的 mtime。
+            None => Ok(Self::fattr(
+                id,
+                true,
+                listing::VIRTUAL_MODE,
+                0,
+                basket.mtime(),
+            )),
         }
     }
 
@@ -331,7 +338,7 @@ impl NFSFileSystem for BasketNfs {
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
         let (basket, sub) = self.target(id).await?;
         let Some((path, meta)) = Self::disk_path(&basket, &sub).await? else {
-            // 篮子根是目录。
+            // 虚拟目录是目录。
             return Err(nfsstat3::NFS3ERR_ISDIR);
         };
         if meta.is_dir() {
@@ -571,7 +578,7 @@ mod tests {
         std::fs::remove_file(&f).unwrap();
 
         // 写不写得了不靠这些位：写操作一律 NFS3ERR_ROFS，挂载命令里带 `ro`。
-        assert_eq!(BasketNfs::ROOT_MODE, 0o755);
+        assert_eq!(listing::VIRTUAL_MODE, 0o755);
         assert_eq!(
             listing::mode_of(&meta) & 0o111,
             0,

@@ -4,8 +4,16 @@
 //! `id` 一行是访问凭证。**文件是唯一真相**——服务只读它，唯一一处写入是补一个缺失的 `id`。
 //!
 //! 篮子不是一个目录：文件留在原处，这里只记录引用。见 ADR-0001。
+//!
+//! 一行路径中间可以有 `/./`：它前面那段只用来拼源路径，后面那段是篮子里的可见路径
+//! （ADR-0009）。可见路径可能不止一段，所以篮子根长出来的是一棵树：中间层是虚拟目录，
+//! 只有被点名的叶子对到磁盘。
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, bail};
 
@@ -15,10 +23,23 @@ pub const SUFFIX: &str = ".basket";
 /// 篮子里的东西。放进来的是引用，源文件不动。
 #[derive(Debug, Clone)]
 pub struct Cherry {
-    /// 在篮子里的名字：源路径的最后一段，也是 listing 路径的第一段。
-    pub name: String,
+    /// 在篮子里的可见路径，可能带 `/`（`/./` 后面那段）。
+    pub path: String,
     /// 创建者磁盘上的绝对路径。
     pub source: PathBuf,
+    /// 文件里的行号。只用来报撞名/包含关系时指哪一行。
+    pub line: usize,
+}
+
+/// 可见路径的树节点。`source` 有值表示这里正好是一颗 cherry；否则是虚拟目录。
+#[derive(Debug, Default)]
+pub struct Node {
+    pub source: Option<PathBuf>,
+    pub children: BTreeMap<String, Node>,
+    /// 这颗 cherry，或者这棵子树里第一条的行号。报错用。
+    line: usize,
+    /// 这颗 cherry 的可见路径（虚拟节点没有）。报错用。
+    visible: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -30,21 +51,68 @@ pub struct Basket {
     /// 定义这个篮子的文件（`<数据目录>/<名字>.basket`）。
     pub file: PathBuf,
     pub cherries: Vec<Cherry>,
+    /// 可见路径的树。只由 `.basket` 文件决定，源文件变化不用重建；克隆只加引用计数。
+    tree: Arc<Node>,
+    /// 定义这个篮子的文件的 mtime（Unix 秒）。虚拟目录拿它当 mtime。
+    file_mtime: u64,
 }
 
 impl Basket {
-    pub fn cherry(&self, name: &str) -> Option<&Cherry> {
-        self.cherries.iter().find(|c| c.name == name)
+    /// 用一组 cherry 造一个篮子。主要给测试和迁移用；正常读文件走 [`load`]。
+    pub fn new(id: [u8; 16], name: String, file: PathBuf, cherries: Vec<Cherry>) -> Result<Self> {
+        let tree = build_tree(&cherries)?;
+        Ok(Self::with_tree(id, name, file, cherries, tree))
     }
 
-    /// 篮子根那个虚拟目录的 mtime：定义它的那个文件的 mtime。
-    ///
-    /// 篮子根在磁盘上没有对应物，但它得有一个**真的**时间，而「篮子的定义变了吗」正好有
-    /// 对应物——改一行就碰一下这个文件，改源文件内容不会。
-    pub fn mtime(&self) -> u64 {
-        std::fs::metadata(&self.file)
+    fn with_tree(
+        id: [u8; 16],
+        name: String,
+        file: PathBuf,
+        cherries: Vec<Cherry>,
+        tree: Node,
+    ) -> Self {
+        let file_mtime = std::fs::metadata(&file)
             .map(|m| crate::listing::mtime_of(&m))
-            .unwrap_or(0)
+            .unwrap_or(0);
+        Self {
+            id,
+            name,
+            file,
+            cherries,
+            tree: Arc::new(tree),
+            file_mtime,
+        }
+    }
+
+    pub fn tree(&self) -> &Node {
+        &self.tree
+    }
+
+    /// 只看虚拟树：路径必须落在虚拟目录上（根或中间层）。落在真 cherry 上或它里面返回 None。
+    pub fn virtual_node(&self, path: &str) -> Option<&Node> {
+        let mut node = &*self.tree;
+        if path.is_empty() {
+            return Some(node);
+        }
+        for seg in path.split('/') {
+            if seg.is_empty() || seg == "." || seg == ".." {
+                return None;
+            }
+            let child = node.children.get(seg)?;
+            if child.source.is_some() {
+                return None;
+            }
+            node = child;
+        }
+        Some(node)
+    }
+
+    /// 虚拟目录的 mtime：定义这个篮子的那个文件的时间。
+    ///
+    /// 篮子结构只由这份文件决定，所以它变了才需要让客户端的目录缓存失效。源文件内容
+    /// 变化只影响那一条自己的属性，不影响目录。
+    pub fn mtime(&self) -> u64 {
+        self.file_mtime
     }
 }
 
@@ -74,24 +142,26 @@ pub fn load(path: &Path) -> Result<Basket> {
         }
     };
 
-    Ok(Basket {
+    Ok(Basket::with_tree(
         id,
         name,
-        file: path.to_path_buf(),
-        cherries: parsed.cherries,
-    })
+        path.to_path_buf(),
+        parsed.cherries,
+        parsed.tree,
+    ))
 }
 
 #[derive(Debug)]
 struct Parsed {
     id: Option<[u8; 16]>,
     cherries: Vec<Cherry>,
+    tree: Node,
 }
 
 /// 解析文件内容。行号从 1 数，出错时报给人看的就是这个号。
 ///
-/// 规矩只有三条：`#` 开头和空行忽略；`id <32 位十六进制>` 是凭证（最多一行）；其余每行
-/// 是一条路径（`~/` 开头或绝对路径），篮子里的名字取自最后一段。
+/// 规矩只有四条：`#` 开头和空行忽略；`id <32 位十六进制>` 是凭证（最多一行）；其余每行
+/// 是一条路径（`~/` 开头或绝对路径）；路径里第一个 `.` 段把「源」和「可见路径」分开。
 fn parse(text: &str) -> Result<Parsed> {
     let mut id = None;
     let mut cherries: Vec<Cherry> = Vec::new();
@@ -118,20 +188,128 @@ fn parse(text: &str) -> Result<Parsed> {
             continue;
         }
 
-        let source = expand(line, n)?;
+        let (path, source) = split_line(line, n)?;
+        cherries.push(Cherry {
+            path,
+            source,
+            line: n,
+        });
+    }
+
+    let tree = build_tree(&cherries)?;
+    Ok(Parsed { id, cherries, tree })
+}
+
+/// 一行路径 →（篮子里的可见路径，磁盘上的源路径）。
+///
+/// 第一个 `.` 段是分界（`/./`）：前面只用来拼源路径，后面就是篮子里的层级。没有 `.` 段就
+/// 还是老规矩，取最后一段当名字。可见路径可以带空格；名字段不能有空的、`.` 或 `..`。
+fn split_line(raw: &str, n: usize) -> Result<(String, PathBuf)> {
+    // 结尾的斜杠没有意义，先去掉：`~/a/` 和 `~/a` 该是同一颗。
+    let trimmed = raw.trim_end_matches('/');
+    let raw = if trimmed.is_empty() { "/" } else { trimmed };
+    if !(raw == "~" || raw.starts_with("~/") || raw.starts_with('/')) {
+        bail!("第 {n} 行：`{raw}` 不是绝对路径（可以写成 ~/…）");
+    }
+
+    let comps: Vec<&str> = raw.split('/').collect();
+    let Some(at) = comps.iter().position(|c| *c == ".") else {
+        let source = expand(raw, n)?;
         let name = source
             .file_name()
             .and_then(|n| n.to_str())
             .filter(|n| !n.is_empty() && *n != "." && *n != "..")
-            .with_context(|| format!("第 {n} 行：`{line}` 没有能当名字的最后一段"))?
+            .with_context(|| format!("第 {n} 行：`{raw}` 没有能当名字的最后一段"))?
             .to_owned();
-        if cherries.iter().any(|c| c.name == name) {
-            bail!("第 {n} 行：篮子里已经有一个叫 `{name}` 的了（两个路径的最后一段撞了）");
+        return Ok((name, source));
+    };
+
+    let visible_segs = &comps[at + 1..];
+    if visible_segs.is_empty() {
+        bail!("第 {n} 行：`/./` 后面得有一段可见路径");
+    }
+    for seg in visible_segs {
+        if seg.is_empty() || *seg == "." || *seg == ".." {
+            bail!("第 {n} 行：`/./` 后面的可见路径不能有空段、`.` 或 `..`");
         }
-        cherries.push(Cherry { name, source });
     }
 
-    Ok(Parsed { id, cherries })
+    let visible = visible_segs.join("/");
+    let prefix = comps[..at].join("/");
+    let raw_source = if prefix.is_empty() {
+        format!("/{visible}")
+    } else {
+        format!("{prefix}/{visible}")
+    };
+    let source = expand(&raw_source, n)?;
+    Ok((visible, source))
+}
+
+/// 把可见路径插进树。撞名和「一条盖住另一条」都在这里挡下来，报两边的行号。
+fn build_tree(cherries: &[Cherry]) -> Result<Node> {
+    let mut root = Node::default();
+    for c in cherries {
+        let segs: Vec<&str> = c.path.split('/').collect();
+        insert(&mut root, &segs, c)?;
+    }
+    Ok(root)
+}
+
+fn insert(node: &mut Node, segs: &[&str], c: &Cherry) -> Result<()> {
+    if node.source.is_some() {
+        let at = node.visible.as_deref().unwrap_or("?");
+        if segs.is_empty() {
+            bail!(
+                "第 {} 行：`{}` 和前面第 {} 行的 `{}` 重了",
+                c.line,
+                c.path,
+                node.line,
+                at
+            );
+        }
+        bail!(
+            "第 {} 行：`{}` 落在第 {} 行的 `{}` 里面；一颗 cherry 和它里面的东西不能同时点名",
+            c.line,
+            c.path,
+            node.line,
+            at
+        );
+    }
+
+    let Some((head, rest)) = segs.split_first() else {
+        if let Some(child) = node.children.values().next() {
+            let leaf = first_leaf(child);
+            let at = leaf.and_then(|n| n.visible.as_deref()).unwrap_or("?");
+            let line = leaf.map(|n| n.line).unwrap_or(child.line);
+            bail!(
+                "第 {} 行：`{}` 盖住了第 {} 行的 `{}`；一颗 cherry 和它里面的东西不能同时点名",
+                c.line,
+                c.path,
+                line,
+                at
+            );
+        }
+        node.source = Some(c.source.clone());
+        node.visible = Some(c.path.clone());
+        node.line = c.line;
+        return Ok(());
+    };
+
+    let child = node
+        .children
+        .entry((*head).to_owned())
+        .or_insert_with(|| Node {
+            line: c.line,
+            ..Node::default()
+        });
+    insert(child, rest, c)
+}
+
+fn first_leaf(node: &Node) -> Option<&Node> {
+    if node.source.is_some() {
+        return Some(node);
+    }
+    node.children.values().find_map(first_leaf)
 }
 
 /// `~/` 展开成家目录，其余必须是绝对路径。
@@ -231,9 +409,9 @@ id 3f2ae0c1d9b84f5a8c1d2e3f4a5b6c7d
         let p = parse(text).unwrap();
         assert_eq!(p.id.unwrap()[0], 0x3f);
         assert_eq!(p.cherries.len(), 2);
-        assert_eq!(p.cherries[0].name, "Pictures");
+        assert_eq!(p.cherries[0].path, "Pictures");
         assert_eq!(p.cherries[0].source, home().join("Pictures"));
-        assert_eq!(p.cherries[1].name, "tmp");
+        assert_eq!(p.cherries[1].path, "tmp");
     }
 
     #[test]
@@ -244,9 +422,86 @@ id 3f2ae0c1d9b84f5a8c1d2e3f4a5b6c7d
     }
 
     #[test]
-    fn 两个路径最后一段撞了要报出来() {
+    fn 两条路径最后一段撞了要报出来() {
         let err = parse("/a/x.txt\n/b/x.txt\n").unwrap_err().to_string();
         assert!(err.contains("第 2 行") && err.contains("`x.txt`"), "{err}");
+        assert!(err.contains("第 1 行"), "另一行也得指出来: {err}");
+    }
+
+    /// `/./` 前面只用来拼源路径，后面是篮子里的可见路径（ADR-0009）。
+    #[test]
+    fn 斜杠点保留目录层级() {
+        let text = "\
+~/.pi/./agent/APPEND_SYSTEM.md
+/Users/edh/dev/mt6000/./edproxy/dist
+";
+        let p = parse(text).unwrap();
+        assert_eq!(p.cherries[0].path, "agent/APPEND_SYSTEM.md");
+        assert_eq!(
+            p.cherries[0].source,
+            home().join(".pi/agent/APPEND_SYSTEM.md")
+        );
+        assert_eq!(p.cherries[1].path, "edproxy/dist");
+        assert_eq!(
+            p.cherries[1].source,
+            PathBuf::from("/Users/edh/dev/mt6000/edproxy/dist")
+        );
+    }
+
+    /// 两个都叫 `dist` 的目录，只要 `/./` 后面的前缀不同，就不撞。
+    #[test]
+    fn 不同前缀的同名目录不撞() {
+        let p = parse("/a/./edproxy/dist\n/b/./cherryshare/dist\n").unwrap();
+        assert_eq!(p.cherries.len(), 2);
+        assert_eq!(p.tree.children.len(), 2);
+        assert!(p.tree.children["edproxy"].source.is_none());
+        assert!(p.tree.children["cherryshare"].source.is_none());
+        assert_eq!(
+            p.tree.children["edproxy"].children["dist"]
+                .source
+                .as_deref(),
+            Some(Path::new("/a/edproxy/dist"))
+        );
+    }
+
+    #[test]
+    fn 可见路径重了要指到两行() {
+        let err = parse("/a/./x\n/b/./x\n").unwrap_err().to_string();
+        assert!(err.contains("第 1 行") && err.contains("第 2 行"), "{err}");
+    }
+
+    /// 一棵 cherry 和它里面的东西不能同时点名：那会搞不清 `agent` 是整颗还是外壳。
+    #[test]
+    fn 一颗cherry不能盖住它里面的路径() {
+        for text in ["/a/./x\n/b/./x/y\n", "/a/./x/y\n/b/./x\n"] {
+            let err = parse(text).unwrap_err().to_string();
+            assert!(
+                err.contains("第 1 行") && err.contains("第 2 行"),
+                "{text}: {err}"
+            );
+            assert!(err.contains("不能同时点名"), "{text}: {err}");
+        }
+    }
+
+    #[test]
+    fn 斜杠点后面不能是空的或点() {
+        for bad in ["~/a/./\n", "~/a/./../b\n", "~/a/.//b\n"] {
+            assert!(parse(bad).is_err(), "该拒：{bad:?}");
+        }
+        // 相对路径开头的 `.` 不是分界，仍然按相对路径拒。
+        assert!(parse("./a/./b\n").is_err());
+    }
+
+    /// 中间层是虚拟目录，叶子才是真 cherry。
+    #[test]
+    fn 树按可见路径分层() {
+        let p = parse("/a/./agent/x\n/a/./agent/y/z\n/a/./agent/skills/s\n").unwrap();
+        let agent = &p.tree.children["agent"];
+        assert!(agent.source.is_none());
+        assert_eq!(agent.children.len(), 3);
+        assert!(agent.children["x"].source.is_some());
+        assert!(agent.children["y"].source.is_none());
+        assert!(agent.children["y"].children["z"].source.is_some());
     }
 
     #[test]
@@ -259,7 +514,15 @@ id 3f2ae0c1d9b84f5a8c1d2e3f4a5b6c7d
     #[test]
     fn 名字可以带空格和引号() {
         let p = parse("/a/我的 照片 'x'\n").unwrap();
-        assert_eq!(p.cherries[0].name, "我的 照片 'x'");
+        assert_eq!(p.cherries[0].path, "我的 照片 'x'");
+    }
+
+    /// `/./` 后面的可见路径也可以带空格；路径和名字之间没有第二层分隔符。
+    #[test]
+    fn 可见路径可以带空格() {
+        let p = parse("/a/./我的 照片/x\n").unwrap();
+        assert_eq!(p.cherries[0].path, "我的 照片/x");
+        assert_eq!(p.cherries[0].source, PathBuf::from("/a/我的 照片/x"));
     }
 
     #[test]

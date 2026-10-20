@@ -249,11 +249,15 @@ async fn size_json(app: &App, basket: &Basket, sub: Option<String>) -> Response 
 
     let done = tokio::task::spawn_blocking(move || -> Result<tree::Sized> {
         let _permit = permit;
-        let (path, meta) = listing::resolve(&b, &s)?;
-        if !meta.is_dir() {
-            bail!("`{s}` 不是一个目录");
+        match listing::resolve(&b, &s)? {
+            listing::Resolved::Disk(path, meta) => {
+                if !meta.is_dir() {
+                    bail!("`{s}` 不是一个目录");
+                }
+                Ok(tree::size_of(&path))
+            }
+            listing::Resolved::Virtual => Ok(tree::size_of_virtual(&b, &s)),
         }
-        Ok(tree::size_of(&path))
     })
     .await;
 
@@ -283,7 +287,9 @@ async fn serve_file(
     match tokio::task::spawn_blocking(move || listing::resolve(&b, &s)).await {
         // 目录不是文件。网页上要进目录是另一个请求（`_api/list?path=`），
         // 直接 GET 一个目录只可能是手敲 URL，那就说清楚。
-        Ok(Ok((path, meta))) if meta.is_file() => serve_path(&path, headers, range, head).await,
+        Ok(Ok(listing::Resolved::Disk(path, meta))) if meta.is_file() => {
+            serve_path(&path, headers, range, head).await
+        }
         Ok(Ok(_)) => plain(StatusCode::NOT_FOUND, "那是个目录，不是文件"),
         // 「不存在」和「非法」给同一个回答：别让人拿状态码探路。
         _ => no_such_file(),
@@ -295,33 +301,38 @@ async fn serve_file(
 /// 路径校验跟 NFS、跟单个文件共享同一套（`listing::resolve`）——网页是第二个入口，
 /// 不是新的权限模型。
 ///
-/// 篮子根是特别的：它不是一个目录，是一排 cherry 并排，所以没有能 `resolve` 的单个路径，
-/// 整篮子打包就是每颗 cherry 各自当一条顶层条目。
+/// 篮子根和 `/./` 造出来的中间层是虚拟目录（ADR-0009）：没有能 `resolve` 的单个磁盘路径，
+/// 打包时走同一棵可见路径树；真目录落地时才走磁盘。
 async fn zip_dir(app: &App, basket: &Basket, sub: &str, head: bool) -> Response {
     let (job, filename) = if sub.is_empty() {
-        let roots = basket
-            .cherries
-            .iter()
-            .map(|c| (c.name.clone(), c.source.clone()))
-            .collect();
-        (Job::Roots(roots), basket.name.clone())
+        (
+            Job::Virtual {
+                basket: basket.clone(),
+                path: String::new(),
+            },
+            basket.name.clone(),
+        )
     } else {
-        let (b, s) = (basket.clone(), sub.to_owned());
-        let dir = match tokio::task::spawn_blocking(move || listing::resolve(&b, &s)).await {
-            Ok(Ok((path, meta))) if meta.is_dir() => path,
-            // 文件不用打包，直接下就行（页面上也不会这么点）。
-            Ok(Ok(_)) => return plain(StatusCode::BAD_REQUEST, "那是个文件，不用打包"),
-            _ => return no_such_file(),
-        };
         // 包内第一层目录名 = 对方在页面上看到的那个名字。
         let name = sub.rsplit('/').next().unwrap_or_default().to_owned();
-        (
-            Job::Dir {
+        let (b, s) = (basket.clone(), sub.to_owned());
+        let job = match tokio::task::spawn_blocking(move || listing::resolve(&b, &s)).await {
+            Ok(Ok(listing::Resolved::Disk(dir, meta))) if meta.is_dir() => Job::Dir {
                 root: dir,
                 wrapper: name.clone(),
             },
-            name,
-        )
+            // 虚拟目录没有磁盘路径，打包时走树。
+            Ok(Ok(listing::Resolved::Virtual)) => Job::Virtual {
+                basket: basket.clone(),
+                path: sub.to_owned(),
+            },
+            // 文件不用打包，直接下就行（页面上也不会这么点）。
+            Ok(Ok(listing::Resolved::Disk(..))) => {
+                return plain(StatusCode::BAD_REQUEST, "那是个文件，不用打包");
+            }
+            _ => return no_such_file(),
+        };
+        (job, name)
     };
 
     let disposition = content_disposition(&filename);
@@ -346,12 +357,12 @@ async fn zip_dir(app: &App, basket: &Basket, sub: &str, head: bool) -> Response 
     stream_zip(job, filename, disposition, permit)
 }
 
-/// 要打的东西。两种形状是因为篮子根和普通目录本来就不一样。
+/// 要打的东西。两种形状是因为真目录和虚拟目录本来就不一样。
 enum Job {
-    /// 篮子里的一个目录：套一层同名目录。
+    /// 磁盘上的一个目录：套一层同名目录。
     Dir { root: PathBuf, wrapper: String },
-    /// 整个篮子：顶层条目并排。
-    Roots(Vec<(String, PathBuf)>),
+    /// 虚拟目录：`path` 是篮子内的可见路径，空串是篮子根（根不套外套那层）。
+    Virtual { basket: Basket, path: String },
 }
 
 fn zip_headers(disposition: String) -> axum::http::response::Builder {
@@ -377,7 +388,7 @@ fn stream_zip(
         let mut out = tokio_util::io::SyncIoBridge::new(writer);
         let done = match &job {
             Job::Dir { root, wrapper } => tree::write_zip_dir(root, wrapper, &mut out),
-            Job::Roots(roots) => tree::write_zip_roots(roots, &mut out),
+            Job::Virtual { basket, path } => tree::write_zip_virtual(basket, path, &mut out),
         };
         match done {
             Ok(p) => tracing::info!(

@@ -64,7 +64,8 @@ e2e:
     D=$(mktemp -d)      # 服务的数据目录
     BASE=$(mktemp -d)   # 要分享的东西（下面在它里面建个定名子目录：cherry 的名字取自目录名）
     SRC="$BASE/share"
-    mkdir -p "$SRC/sub"
+    TREE="$BASE/tree"
+    mkdir -p "$SRC/sub" "$TREE/agent/extensions" "$TREE/agent/skills/wan"
     CHERRYSHARE_DATA_DIR="$D" CHERRYSHARE_WEB_DIR="$WEB" "$CHERRYD" >"$D/log" 2>&1 &
     SVC=$!
     MP=""
@@ -78,10 +79,15 @@ e2e:
     echo hi >"$SRC/sub/a.txt"
     mkdir -p "$SRC/emptydir"                        # 空目录也得留得住
     ln -s "$SRC/sub/a.txt" "$SRC/link"   # 符号链接不该被共享
+    echo agent >"$TREE/agent/APPEND_SYSTEM.md"
+    echo timer >"$TREE/agent/extensions/llm-timer.ts"
+    echo skill >"$TREE/agent/skills/wan/SKILL.md"
 
     # 篮子就是数据目录里的一个文件（ADR-0008）：写一行路径就有了，没有写命令。
     # 这里故意不给 id，看服务会不会自己补一行、而且补在说明后面。
-    printf '# e2e\n%s\n' "$SRC" >"$D/t.basket"
+    # 后面三条带 `/./`：篮子根上长出 agent/，中间层是虚拟目录，wan 是叶子上的真目录。
+    printf '# e2e\n%s\n%s/./agent/APPEND_SYSTEM.md\n%s/./agent/extensions/llm-timer.ts\n%s/./agent/skills/wan\n' \
+        "$SRC" "$TREE" "$TREE" "$TREE" >"$D/t.basket"
     cherry show t
     grep -q '^id [0-9a-f]\{32\}$' "$D/t.basket" || { echo "没补 id ✗" >&2; exit 1; }
     head -1 "$D/t.basket" | grep -q '^# e2e$' || { echo "说明被冲掉了 ✗" >&2; exit 1; }
@@ -121,6 +127,12 @@ e2e:
         exit 1
     }
     if [ -e "$MP/share/link" ]; then echo "符号链接泄漏出来了 ✗" >&2; exit 1; fi
+    # `/./` 的中间层在挂载点上也长成目录，内容只包含点名的三条。
+    diff -r "$TREE/agent" "$MP/agent" >/dev/null || {
+        echo "虚拟目录在挂载点上不一致 ✗" >&2
+        diff -r "$TREE/agent" "$MP/agent" | head -5 >&2
+        exit 1
+    }
     # 权限位照实报：挂载点上看到的就是源文件的权限，对方 `cp` 出来才是正常文件。
     # （0.4.2 之前导出把它报成 0444，`cp -R` 出来的东西全是只读的。）
     [ "$(stat -f %Lp "$MP/share/big.bin")" = "$(stat -f %Lp "$SRC/big.bin")" ] || {
@@ -165,6 +177,17 @@ e2e:
     curl -sI "$W/b/$WID/_api/list" | grep -qi "^cache-control: no-store" ||
         { echo "活索引的 JSON 不该被缓存 ✗" >&2; exit 1; }
     curl -sf "$W/b/$WID/_api/list?path=share" | grep -q 'big.bin' || { echo "进不了子目录 ✗" >&2; exit 1; }
+    # `/./`：根上长出 agent，中间层只列点名的子项。
+    curl -sf "$W/b/$WID/_api/list" | grep -q '"name":"agent"' ||
+        { echo "根上没有虚拟目录 agent ✗" >&2; exit 1; }
+    curl -sf "$W/b/$WID/_api/list?path=agent" | grep -q '"name":"extensions"' ||
+        { echo "虚拟目录里没有 extensions ✗" >&2; exit 1; }
+    curl -sf "$W/b/$WID/_api/list?path=agent/extensions" | grep -q '"name":"llm-timer.ts"' ||
+        { echo "虚拟子目录里没有 llm-timer.ts ✗" >&2; exit 1; }
+    [ "$(curl -sf "$W/b/$WID/agent/APPEND_SYSTEM.md")" = "agent" ] ||
+        { echo "虚拟路径下的文件内容不对 ✗" >&2; exit 1; }
+    [ "$(curl -sf "$W/b/$WID/agent/skills/wan/SKILL.md")" = "skill" ] ||
+        { echo "真目录叶子下的文件内容不对 ✗" >&2; exit 1; }
     C=$(curl -sf "$W/b/$WID/share/big.bin" | shasum -a 256 | cut -d' ' -f1)
     [ "$C" = "$A" ] || { echo "网页上取到的字节跟源不一致 ✗" >&2; exit 1; }
     R=$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -r 0-99 "$W/b/$WID/share/big.bin")
@@ -192,9 +215,17 @@ e2e:
     # 所以要有一条看着它的。
     unzip -v "$D/pack.zip" | grep "photo.png" | grep -q "Stored" || { echo "png 没按原始存 ✗" >&2; exit 1; }
     unzip -v "$D/pack.zip" | grep "a.txt" | grep -q "Defl" || { echo "文本没被压 ✗" >&2; exit 1; }
-    # 整篮子：篮子根是一排 cherry，没有外套那层。
+    # 整篮子：顶层条目并排，没有外套那层。
     curl -sf "$W/b/$WID/?dl=zip" -o "$D/all.zip" || { echo "整篮子打不下来 ✗" >&2; exit 1; }
     unzip -l "$D/all.zip" | grep -q "share/big.bin" || { echo "整篮子里没有那颗 cherry ✗" >&2; exit 1; }
+    unzip -l "$D/all.zip" | grep -q "agent/APPEND_SYSTEM.md" ||
+        { echo "整篮子里没有 /./ 的文件 ✗" >&2; exit 1; }
+    unzip -l "$D/all.zip" | grep -q "agent/skills/wan/SKILL.md" ||
+        { echo "整篮子里没有 /./ 的目录叶子 ✗" >&2; exit 1; }
+    # 下载一层虚拟目录：包内先套一层同名目录。
+    curl -sf "$W/b/$WID/agent?dl=zip" -o "$D/agent.zip" || { echo "虚拟目录打不下来 ✗" >&2; exit 1; }
+    unzip -l "$D/agent.zip" | grep -q "agent/APPEND_SYSTEM.md" ||
+        { echo "虚拟目录包里的结构不对 ✗" >&2; exit 1; }
     # 参数写错、或者对文件要打包，都要明说，不能默默给个别的东西。
     code=$(curl -s -o /dev/null -w '%{http_code}' "$W/b/$WID/share?dl=tar")
     [ "$code" = "400" ] || { echo "参数写错该是 400，得到 $code ✗" >&2; exit 1; }
@@ -212,6 +243,11 @@ e2e:
         echo "这么小的树不该提前停 ✗" >&2
         exit 1
     }
+    # 虚拟目录只算点名的子树：三个 6 字节的文件，别的不碰。
+    curl -sf "$W/b/$WID/_api/size?path=agent" | grep -q '"bytes":18' || {
+        echo "虚拟目录的大小不对 ✗" >&2
+        exit 1
+    }
     MANY="$BASE/many"
     # 一次 mkdir 建一万多个，比建一万个文件便宜。注意数目得**过**一万：正好一万条是
     # 算得完的，那时报 done 才是对的。
@@ -227,7 +263,10 @@ e2e:
 
     # 源没了：挂载点根目录照常列（不是整层失败）、日志留一条；但文件是你的，工具不替你改
     # （ADR-0008）——那一行还在，`cherry show` 得把它标出来。
-    rm -rf "$SRC"
+    # 先把 `/./` 那几条摘掉，这一节只看 share：虚拟目录的壳在叶子都没了之后还会留着，
+    # 那是另一条语义，别混进这个断言。
+    grep -v "$TREE" "$D/t.basket" >"$D/t.tmp" && mv "$D/t.tmp" "$D/t.basket"
+    rm -rf "$SRC" "$TREE"
     sleep 6   # 等 actimeo=5 的目录缓存过期
     if ! LEFT=$(ls "$MP" 2>&1); then
         echo "源没了之后挂载点根目录列不出来了 ✗: $LEFT" >&2
@@ -244,7 +283,7 @@ e2e:
     [ "$code" = "404" ] || { echo "删掉篮子之后旧链接还能用 ✗: $code" >&2; exit 1; }
     if cherry show t >/dev/null 2>&1; then echo "篮子还在 ✗" >&2; exit 1; fi
 
-    echo "✓ 端到端通过：内容一致、符号链接没出来、写不进去、源没了之后连坐没有发生、网页那条路通、打包能解开、目录大小算得对且有预算、删篮子之后旧链接打不开"
+    echo "✓ 端到端通过：内容一致、符号链接没出来、写不进去、虚拟目录能进能取能打包、源没了之后连坐没有发生、网页那条路通、打包能解开、目录大小算得对且有预算、删篮子之后旧链接打不开"
 # 出一个版本。参数必须跟 Cargo.toml 里的版本一致。
 release version:
     #!/usr/bin/env bash

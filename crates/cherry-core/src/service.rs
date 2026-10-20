@@ -446,7 +446,7 @@ mod tests {
         let b = svc.basket("t").await.unwrap();
         assert_eq!(b.name, "t");
         assert_eq!(b.cherries.len(), 1);
-        assert_eq!(b.cherries[0].name, "src");
+        assert_eq!(b.cherries[0].path, "src");
         assert!(!svc.links("t").await.unwrap().is_empty());
 
         // 换一个 Service 从头读：id 得一样（它落在文件里），篮子还在。
@@ -466,7 +466,7 @@ mod tests {
         }
         let file = write_basket(&dir, "t", &format!("{}\n", a.display()));
         let svc = Service::start(dir.clone()).await.unwrap();
-        assert_eq!(svc.basket("t").await.unwrap().cherries[0].name, "a");
+        assert_eq!(svc.basket("t").await.unwrap().cherries[0].path, "a");
 
         std::fs::write(&file, format!("{}\n{}\n", a.display(), b.display())).unwrap();
         assert_eq!(svc.basket("t").await.unwrap().cherries.len(), 2);

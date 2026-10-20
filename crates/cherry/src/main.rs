@@ -155,7 +155,7 @@ fn print(resp: Response) {
 fn print_empty_hint(dir: &std::path::Path, empty: bool) {
     if empty {
         println!(
-            "（还没有 basket。在 {} 里写个 <名字>.basket，一行一条要分享的路径，以 ~/ 开头或写绝对路径）",
+            "（还没有 basket。在 {} 里写个 <名字>.basket，一行一条要分享的路径，以 ~/ 开头或写绝对路径；\n  想在篮子里保留目录，就写成 `前缀/./可见/路径`）",
             dir.display()
         );
     }

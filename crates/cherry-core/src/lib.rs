@@ -8,7 +8,7 @@ pub mod link;
 pub mod listing;
 pub mod service;
 
-pub use basket::{Basket, Cherry};
+pub use basket::{Basket, Cherry, Node};
 pub use link::BasketLink;
 pub use listing::{CherryKind, Entry};
 pub use service::Service;
