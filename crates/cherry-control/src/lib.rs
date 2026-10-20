@@ -30,19 +30,9 @@ pub fn socket_path(data_dir: &Path) -> PathBuf {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
     Status,
+    /// 每个篮子的详情（`cherry show` 不给名字的时候）。
     ListBaskets,
     ShowBasket {
-        name: String,
-    },
-    CreateBasket {
-        name: String,
-    },
-    AddCherry {
-        basket: String,
-        path: PathBuf,
-    },
-    RemoveCherry {
-        basket: String,
         name: String,
     },
     /// 每个篮子每个地址一条网页链接——本机名一条，IP 一条（见
@@ -55,6 +45,8 @@ pub enum Request {
 pub enum Response {
     Status {
         baskets: usize,
+        /// 数据目录里读不进来的文件有几个。
+        broken: usize,
         data_dir: PathBuf,
         /// NFS 导出的端口。`nfs_up` 为假说明那个监听没起来（端口被占之类）。
         nfs_port: u16,
@@ -63,9 +55,18 @@ pub enum Response {
         http_port: u16,
         http_up: bool,
     },
-    Baskets(Vec<BasketView>),
+    Baskets {
+        /// 没东西可看的时候得告诉人去哪儿写文件。
+        dir: PathBuf,
+        ok: Vec<BasketView>,
+        broken: Vec<BrokenView>,
+    },
     Basket(BasketView),
-    Links(Vec<LinkSet>),
+    Links {
+        dir: PathBuf,
+        sets: Vec<LinkSet>,
+        broken: Vec<BrokenView>,
+    },
     Error(String),
 }
 
@@ -73,7 +74,22 @@ pub enum Response {
 pub struct BasketView {
     pub name: String,
     pub id: String,
-    pub cherries: Vec<CherryView>,
+    /// 定义这个篮子的文件。要改篮子就是去改它。
+    pub file: String,
+    /// 文件原文。`cherry show` 就是把它打出来——文件是唯一真相，没必要再翻译一遍。
+    pub content: String,
+    /// 文件里写着、但现在读不到的路径（带原因）。这是唯一一处「算出来的东西」：
+    /// 有人看的时候不许可说假的。
+    pub missing: Vec<String>,
+}
+
+/// 数据目录里读不进来的那个文件，以及为什么。它没有 id，所以别人的链接指不到它，
+/// 只在 `cherry list` / `show` 里露面。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokenView {
+    pub name: String,
+    pub file: String,
+    pub error: String,
 }
 
 /// 一个篮子和它能发出去的几条链接。
@@ -83,16 +99,11 @@ pub struct BasketView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinkSet {
     pub name: String,
+    /// 要改这个篮子就去改这个文件。
+    pub file: String,
     /// 篮子里有几颗 cherry。列篮子的时候顺带让人看出它是不是空的。
     pub items: usize,
     pub links: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CherryView {
-    pub name: String,
-    pub kind: String,
-    pub source: String,
 }
 
 // ---- 帧：长度前缀 + postcard ----
@@ -187,66 +198,82 @@ async fn dispatch(svc: &Service, req: &Request) -> Response {
 
 async fn dispatch_inner(svc: &Service, req: &Request) -> Result<Response> {
     match req {
-        Request::Status => Ok(Response::Status {
-            baskets: svc.list_baskets().await.len(),
-            data_dir: svc.data_dir().to_path_buf(),
-            nfs_port: cherry_core::link::NFS_PORT,
-            nfs_up: svc.nfs_up(),
-            http_port: cherry_core::link::http_port(),
-            http_up: svc.http_up(),
-        }),
-        Request::ListBaskets => Ok(Response::Baskets(
-            svc.list_baskets().await.iter().map(view).collect(),
-        )),
+        Request::Status => {
+            let all = svc.baskets().await;
+            Ok(Response::Status {
+                baskets: all.ok.len(),
+                broken: all.broken.len(),
+                data_dir: svc.data_dir().to_path_buf(),
+                nfs_port: cherry_core::link::NFS_PORT,
+                nfs_up: svc.nfs_up(),
+                http_port: cherry_core::link::http_port(),
+                http_up: svc.http_up(),
+            })
+        }
+        Request::ListBaskets => {
+            let all = svc.baskets().await;
+            Ok(Response::Baskets {
+                dir: svc.data_dir().to_path_buf(),
+                ok: all.ok.iter().map(view).collect(),
+                broken: all.broken.iter().map(broken_view).collect(),
+            })
+        }
         Request::ShowBasket { name } => Ok(Response::Basket(view(&svc.basket(name).await?))),
-        Request::CreateBasket { name } => {
-            let b = svc.create_basket(name).await?;
-            Ok(Response::Basket(view(&b)))
-        }
-        Request::AddCherry { basket, path } => {
-            svc.add_cherry(basket, path).await?;
-            Ok(Response::Basket(view(&svc.basket(basket).await?)))
-        }
-        Request::RemoveCherry { basket, name } => {
-            svc.remove_cherry(basket, name).await?;
-            Ok(Response::Basket(view(&svc.basket(basket).await?)))
-        }
         Request::Links => {
-            let mut out = Vec::new();
-            // `list_baskets` 会顺手摘掉源已经没了的引用，所以数出来的是现在的真相。
-            for b in svc.list_baskets().await {
-                out.push(LinkSet {
+            let all = svc.baskets().await;
+            let mut sets = Vec::with_capacity(all.ok.len());
+            for b in &all.ok {
+                sets.push(LinkSet {
+                    name: b.name.clone(),
+                    file: b.file.display().to_string(),
                     items: b.cherries.len(),
                     links: svc
-                        .links(&b.name)
-                        .await?
+                        .links_of(b)?
                         .into_iter()
                         .map(|l| l.to_string())
                         .collect(),
-                    name: b.name,
                 });
             }
-            Ok(Response::Links(out))
+            Ok(Response::Links {
+                dir: svc.data_dir().to_path_buf(),
+                sets,
+                broken: all.broken.iter().map(broken_view).collect(),
+            })
         }
     }
 }
 
+/// 一个篮子交给用户看的样子：文件原文 + 哪几行现在读不到。
+///
+/// 不再自己拼一份「篮子里有什么」——那是文件的事（ADR-0008）。要算的只有死活：
+/// 磁盘上的事文件里没有，而「有人看的时候不许可说假的」。
 fn view(b: &cherry_core::Basket) -> BasketView {
     BasketView {
         name: b.name.clone(),
         id: hex::encode(b.id),
-        cherries: b
+        file: b.file.display().to_string(),
+        content: std::fs::read_to_string(&b.file).unwrap_or_default(),
+        missing: b
             .cherries
             .iter()
-            .map(|c| CherryView {
-                name: c.name.clone(),
-                kind: match c.kind {
-                    cherry_core::CherryKind::File => "文件".into(),
-                    cherry_core::CherryKind::Dir => "文件夹".into(),
-                },
-                source: c.source.display().to_string(),
+            .filter_map(|c| {
+                let why = match std::fs::symlink_metadata(&c.source) {
+                    Ok(meta) if cherry_core::listing::servable(&meta).is_some() => return None,
+                    Ok(_) => "不是普通文件也不是真目录，不共享".to_owned(),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => "源不在了".to_owned(),
+                    Err(e) => format!("读不到元数据: {e}"),
+                };
+                Some(format!("{}（{why}）", c.source.display()))
             })
             .collect(),
+    }
+}
+
+fn broken_view(b: &cherry_core::service::Broken) -> BrokenView {
+    BrokenView {
+        name: b.name.clone(),
+        file: b.file.display().to_string(),
+        error: b.error.clone(),
     }
 }
 
@@ -257,19 +284,13 @@ mod tests {
     #[tokio::test]
     async fn 帧往返() {
         let mut buf = Vec::new();
-        write_frame(
-            &mut buf,
-            &Request::AddCherry {
-                basket: "b".into(),
-                path: "a/b.txt".into(),
-            },
-        )
-        .await
-        .unwrap();
+        write_frame(&mut buf, &Request::ShowBasket { name: "b".into() })
+            .await
+            .unwrap();
 
         let mut cur = std::io::Cursor::new(buf);
         let got: Request = read_frame(&mut cur).await.unwrap().unwrap();
-        assert!(matches!(got, Request::AddCherry { .. }));
+        assert!(matches!(got, Request::ShowBasket { .. }));
     }
 
     #[tokio::test]

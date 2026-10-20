@@ -79,12 +79,14 @@ e2e:
     mkdir -p "$SRC/emptydir"                        # 空目录也得留得住
     ln -s "$SRC/sub/a.txt" "$SRC/link"   # 符号链接不该被共享
 
-    cherry new t >/dev/null
-    # 特意用相对路径加：客户端得按自己的 cwd 解析（服务那头的 cwd 是 /）。
-    (cd "$BASE" && cherry add t ./share) >/dev/null
+    # 篮子就是数据目录里的一个文件（ADR-0008）：写一行路径就有了，没有写命令。
+    # 这里故意不给 id，看服务会不会自己补一行、而且补在说明后面。
+    printf '# e2e\n%s\n' "$SRC" >"$D/t.basket"
     cherry show t
+    grep -q '^id [0-9a-f]\{32\}$' "$D/t.basket" || { echo "没补 id ✗" >&2; exit 1; }
+    head -1 "$D/t.basket" | grep -q '^# e2e$' || { echo "说明被冲掉了 ✗" >&2; exit 1; }
 
-    WID=$(cherry show t | head -1 | sed 's/.*\[\(.*\)\]/\1/')
+    WID=$(grep -o '^id [0-9a-f]\{32\}' "$D/t.basket" | cut -d' ' -f2)
     W="http://127.0.0.1:20480"
     # 一个篮子一小段：头上是名字，下面两条链接（名字一条、IP 一条）。
     URLS=$(cherry list | grep -o 'http://[^ ]*')
@@ -214,16 +216,17 @@ e2e:
     # 一次 mkdir 建一万多个，比建一万个文件便宜。注意数目得**过**一万：正好一万条是
     # 算得完的，那时报 done 才是对的。
     mkdir -p "$MANY"/{00001..10050}
-    cherry add t "$MANY" >/dev/null
+    printf '%s\n' "$MANY" >>"$D/t.basket"
     curl -sf "$W/b/$WID/_api/size?path=many" | grep -q '"stop":"too_many"' || {
         echo "过了一万项该停下 ✗" >&2
         exit 1
     }
-    cherry rm t many >/dev/null
+    grep -v "^$MANY$" "$D/t.basket" >"$D/t.tmp" && mv "$D/t.tmp" "$D/t.basket"
     code=$(curl -s -o /dev/null -w '%{http_code}' "$W/b/$WID/_api/size")
     [ "$code" = "400" ] || { echo "算大小不给 path 该是 400，得到 $code ✗" >&2; exit 1; }
 
-    # 源没了：服务把这颗从篮子里摘掉，挂载点根目录照常列（不是整层失败），日志留一条。
+    # 源没了：挂载点根目录照常列（不是整层失败）、日志留一条；但文件是你的，工具不替你改
+    # （ADR-0008）——那一行还在，`cherry show` 得把它标出来。
     rm -rf "$SRC"
     sleep 6   # 等 actimeo=5 的目录缓存过期
     if ! LEFT=$(ls "$MP" 2>&1); then
@@ -231,10 +234,17 @@ e2e:
         exit 1
     fi
     [ -z "$LEFT" ] || { echo "摘掉之后根目录里还剩东西 ✗: $LEFT" >&2; exit 1; }
-    if cherry show t | grep -q share; then echo "篮子里还留着那颗 ✗" >&2; exit 1; fi
+    cherry show t | grep -q "源不在了" || { echo "show 没标出源不在了 ✗" >&2; exit 1; }
+    grep -qx "$SRC" "$D/t.basket" || { echo "工具擅自改了你的篮子文件 ✗" >&2; exit 1; }
     grep -q "源没了" "$D/log" || { echo "日志里没有那条 ✗" >&2; exit 1; }
 
-    echo "✓ 端到端通过：内容一致、符号链接没出来、写不进去、源没了之后连坐没有发生、网页那条路通、打包能解开、目录大小算得对且有预算"
+    # 删篮子就是删文件：id 跟着没了，对方手里那条链接立刻打不开（这就是吊销）。
+    rm "$D/t.basket"
+    code=$(curl -s -o /dev/null -w '%{http_code}' "$W/b/$WID/")
+    [ "$code" = "404" ] || { echo "删掉篮子之后旧链接还能用 ✗: $code" >&2; exit 1; }
+    if cherry show t >/dev/null 2>&1; then echo "篮子还在 ✗" >&2; exit 1; fi
+
+    echo "✓ 端到端通过：内容一致、符号链接没出来、写不进去、源没了之后连坐没有发生、网页那条路通、打包能解开、目录大小算得对且有预算、删篮子之后旧链接打不开"
 # 出一个版本。参数必须跟 Cargo.toml 里的版本一致。
 release version:
     #!/usr/bin/env bash
@@ -286,4 +296,4 @@ release version:
         shasum -a 256 -c SHA256SUMS >/dev/null &&
         echo "$(wc -l <SHA256SUMS | tr -d ' ') 个文件的校验和都对上了")
 
-    printf '\n包好了：%s\n  commit %s，版本 %s\n\n放进篮子：\n  cherry add <篮子名> %s\n' "$DIR" "$COMMIT" "$V" "$DIR"
+    printf '\n包好了：%s\n  commit %s，版本 %s\n\n放进篮子（在数据目录里写一行就分享了）：\n  %s >> ~/.config/cherryshare/<篮子名>.basket\n' "$DIR" "$COMMIT" "$V" "$DIR"

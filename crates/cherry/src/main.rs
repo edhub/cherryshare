@@ -1,15 +1,15 @@
 //! cherry —— CherryShare 的命令行界面。
 //!
-//! 是**完整的**操作界面，不是给脚本用的子集：v1 没有 GUI（ADR-0004），全部操作都靠它。
+//! 是**完整的**操作界面，不是给脚本用的子集：v1 没有 GUI（ADR-0004）。
 //! 它只是 local socket 上的一个消费者，语义判断一律不在这儿做（ADR-0003）。
-//! 唯一一件非它不可的事：把相对路径按**自己的** cwd 变成绝对路径——cherryd 跑在
-//! launchd 底下，cwd 是 `/`，它没法知道用户说的 `./docs` 是哪个目录。
+//!
+//! 这里**只有读命令**：要建篮子、加东西、删东西，就去数据目录里改那个 `.basket` 文件
+//! （ADR-0008）。所以这个程序不需要知道你的 cwd，也不需要把路径变成绝对路径。
 
-use std::path::PathBuf;
-
-use anyhow::{Context, Result, bail};
-use cherry_control::{BasketView, CherryView, Client, Request, Response};
-use cherry_core::{BasketLink, link::Host};
+use anyhow::{Result, bail};
+use cherry_control::{BasketView, BrokenView, Client, LinkSet, Request, Response};
+use cherry_core::BasketLink;
+use cherry_core::link::Host;
 use clap::{CommandFactory, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -31,29 +31,10 @@ enum Cmd {
     Status,
     /// 列出本机所有 basket，每个都给出要发给对方的网页链接——本机名一条、IP 一条
     List,
-    /// 建一个 basket，你可以往 basket 中添加你想要共享的文件、文件夹
-    New {
-        /// 篮子名
-        name: String,
-    },
-    /// 看一个 basket 里有什么；不给篮子就所有篮子都看
+    /// 把一个 basket 文件原样打出来，顺带说哪几行现在读不到；不给篮子就全打
     Show {
-        /// 篮子名。不给我就把所有 basket 列出来
+        /// 篮子名（就是数据目录里那个文件名，去掉 .basket）。不给我就全看
         basket: Option<String>,
-    },
-    /// 往篮子里放东西（放进去的只是引用，文件留在原处）
-    Add {
-        /// 篮子名
-        basket: String,
-        /// 文件或文件夹的路径。相对路径按你现在所在的目录算；篮子里记的永远是绝对路径
-        path: PathBuf,
-    },
-    /// 从篮子里拿走一颗
-    Rm {
-        /// 篮子名
-        basket: String,
-        /// cherry 名
-        name: String,
     },
 }
 
@@ -83,47 +64,22 @@ async fn main() -> Result<()> {
     // 实例（e2e）就设 `CHERRYSHARE_DATA_DIR`——`default_data_dir()` 会读。
     let data_dir = cherry_core::service::default_data_dir()?;
     let mut client = Client::connect(&data_dir).await?;
-    match client.call(&to_request(cmd)?).await? {
+    match client.call(&to_request(cmd)).await? {
         Response::Error(e) => bail!("{e}"),
         other => print(other),
     }
     Ok(())
 }
 
-fn to_request(cmd: Cmd) -> Result<Request> {
-    Ok(match cmd {
+fn to_request(cmd: Cmd) -> Request {
+    match cmd {
         Cmd::Status => Request::Status,
         Cmd::List => Request::Links,
-        Cmd::New { name } => Request::CreateBasket { name },
         Cmd::Show { basket } => match basket {
             Some(name) => Request::ShowBasket { name },
             None => Request::ListBaskets,
         },
-        Cmd::Add { basket, path } => Request::AddCherry {
-            basket,
-            path: absolute(path)?,
-        },
-        Cmd::Rm { basket, name } => Request::RemoveCherry { basket, name },
-    })
-}
-
-/// 把用户敲的路径变成绝对的、解析掉符号链接的路径。
-///
-/// 解析符号链接是因为服务那头本来就不对外提供符号链接（listing::servable），
-/// 记下 resolve 之后的路径，两边说的才是同一个东西。
-/// 顺带当存在性检查：篮子里存的路径得先活得过这一刻。报错时把按哪个目录算的说出来，
-/// 因为相对路径出错时人第一个想知道的就是这个。
-fn absolute(path: PathBuf) -> Result<PathBuf> {
-    std::fs::canonicalize(&path).with_context(|| {
-        if path.is_absolute() {
-            format!("找不到 {}", path.display())
-        } else {
-            let cwd = std::env::current_dir()
-                .map(|d| d.display().to_string())
-                .unwrap_or_else(|_| "?".into());
-            format!("找不到 {}（按当前目录 {cwd} 算的）", path.display())
-        }
-    })
+    }
 }
 
 /// `cherry show` 不带给篮子时也是每颗都给详情——反正它问的就是「里面有什么」。
@@ -132,6 +88,7 @@ fn print(resp: Response) {
         Response::Error(_) => {}
         Response::Status {
             baskets,
+            broken,
             data_dir,
             nfs_port,
             nfs_up,
@@ -139,7 +96,14 @@ fn print(resp: Response) {
             http_up,
         } => {
             println!("data       {}", data_dir.display());
-            println!("baskets    {baskets}");
+            println!(
+                "baskets    {baskets}{}",
+                if broken > 0 {
+                    format!("（另有 {broken} 个文件读不进来，`cherry list` 里有原因）")
+                } else {
+                    String::new()
+                }
+            );
             // 监听没起来就说出来，别让人以为分享是好的。
             println!(
                 "nfs        {nfs_port}  {}",
@@ -158,37 +122,66 @@ fn print(resp: Response) {
                 }
             );
         }
-        Response::Baskets(list) => {
-            if list.is_empty() {
-                println!("（还没有 basket。用 `cherry new <名字>` 建一个）");
+        Response::Baskets { dir, ok, broken } => {
+            print_empty_hint(&dir, ok.is_empty() && broken.is_empty());
+            for (i, b) in ok.iter().enumerate() {
+                if i > 0 {
+                    println!();
+                }
+                print_basket(b, true);
             }
-            for b in &list {
-                print_basket(b);
-            }
+            print_broken(&broken);
         }
-        Response::Basket(b) => print_basket(&b),
+        Response::Basket(b) => print_basket(&b, false),
         // 一个篮子一小段：头上是名字和里面有几样东西，下面两条链接——本机名一条、IP 一条。
         // 两条一起摆出来是因为发送方判不出对方在不在同一个广播域（ADR-0002）：名字过不了
         // 路由和隧道，IP 这边一换 DHCP 地址就废了。URL 由它现场拼，这一步跟以前拼挂载命令
         // 是同一件事，纯粹是格式。
         // 挂载命令不在这儿打了：页面上有，而且那份是按对方自己的系统给的，比这边猜的准。
-        Response::Links(list) => {
-            if list.is_empty() {
-                println!("（还没有 basket。用 `cherry new <名字>` 建一个）");
-            }
-            for (i, set) in list.iter().enumerate() {
+        Response::Links { dir, sets, broken } => {
+            print_empty_hint(&dir, sets.is_empty() && broken.is_empty());
+            for (i, set) in sets.iter().enumerate() {
                 if i > 0 {
                     println!();
                 }
-                println!("{}（{} 项）", set.name, set.items);
-                for raw in &set.links {
-                    match raw.parse::<BasketLink>() {
-                        Ok(link) => println!("  {}  {}", 地址种类(&link.host), link.web_url()),
-                        // 解析不了就照原样打出来，别把服务给的东西吞掉。
-                        Err(_) => println!("  {raw}"),
-                    }
-                }
+                print_links(set);
             }
+            print_broken(&broken);
+        }
+    }
+}
+
+/// 空的时候别只说「空的」：得告诉人去哪儿写文件——现在唯一的写入口就是这个。
+fn print_empty_hint(dir: &std::path::Path, empty: bool) {
+    if empty {
+        println!(
+            "（还没有 basket。在 {} 里写个 <名字>.basket，一行一条要分享的路径，以 ~/ 开头或写绝对路径）",
+            dir.display()
+        );
+    }
+}
+
+fn print_links(set: &LinkSet) {
+    println!("{}（{} 项）  {}", set.name, set.items, set.file);
+    for raw in &set.links {
+        match raw.parse::<BasketLink>() {
+            Ok(link) => println!("  {}  {}", 地址种类(&link.host), link.web_url()),
+            // 解析不了就照原样打出来，别把服务给的东西吞掉。
+            Err(_) => println!("  {raw}"),
+        }
+    }
+}
+
+/// 读不进来的文件单独一段，原因照原文给：那个人得知道去改哪一行。
+fn print_broken(broken: &[BrokenView]) {
+    if broken.is_empty() {
+        return;
+    }
+    println!("\n这些文件没读进来（它们不会被分享）：");
+    for b in broken {
+        println!("  {}", b.file);
+        for line in b.error.lines() {
+            println!("    {line}");
         }
     }
 }
@@ -201,13 +194,27 @@ fn 地址种类(host: &Host) -> &'static str {
     }
 }
 
-fn print_basket(b: &BasketView) {
-    println!("{}  [{}]", b.name, b.id);
-    if b.cherries.is_empty() {
-        println!("  （空的。用 `cherry add {} <路径>` 放东西）", b.name);
+/// 原样打文件内容。要看的就这一份东西：文件是唯一真相（ADR-0008），它长什么样就打成
+/// 什么样，你写的注释也在里面，`id` 那行本来就在里面，不用再抄一遍。
+///
+/// 几个篮子一起打的时候才加一行 `==> 文件 <==`（跟 `head` 一个约定）：不然分不出哪段是
+/// 哪个文件的。单个篮子不加：那条路径就在上面那句里，重复一遍没意思。
+fn print_basket(b: &BasketView, with_header: bool) {
+    if with_header {
+        println!("==> {} <==", b.file);
     }
-    for CherryView { name, kind, source } in &b.cherries {
-        println!("  {name}  {kind}  ← {source}");
+    print!("{}", b.content);
+    if !b.content.is_empty() && !b.content.ends_with('\n') {
+        println!();
+    }
+    if b.content.trim().is_empty() {
+        println!("（空的：在那个文件里写一行路径就有了）");
+    }
+    if !b.missing.is_empty() {
+        println!();
+        for m in &b.missing {
+            println!("  读不到：{m}");
+        }
     }
 }
 
@@ -234,15 +241,15 @@ mod tests {
         assert!(Cli::try_parse_from(["cherry", "list", "--host", "10.0.0.1"]).is_err());
     }
 
-    /// 链接并进 `list` 之后，`cherry link` 就没了（挂载命令在页面上，按对方的系统给）。
+    /// 写入口撤了（ADR-0008）：建篮子、加东西、删东西都是改文件，这里不该再有命令。
     #[test]
-    fn link_子命令没了() {
-        assert!(Cli::try_parse_from(["cherry", "link"]).is_err());
-    }
-
-    #[test]
-    fn add_还是得两个参数() {
-        assert!(Cli::try_parse_from(["cherry", "add", "篮子"]).is_err());
+    fn 只留读命令() {
+        for gone in ["new", "add", "rm", "delete"] {
+            assert!(
+                Cli::try_parse_from(["cherry", gone, "x"]).is_err(),
+                "{gone} 该没了"
+            );
+        }
     }
 
     /// 数据目录不给用户选（正常用不到），客户端就不认这个选项。

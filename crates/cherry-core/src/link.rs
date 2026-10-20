@@ -182,12 +182,15 @@ impl BasketLink {
         hex::decode(s).ok()?.try_into().ok()
     }
 
-    /// 挂载点的最后一段：`<篮子名>-<id 前 8 位>`。两个系统各自拼自己的父目录
+    /// 挂载点的最后一段：`<名字>-<id 前 8 位>`。两个系统各自拼自己的父目录
     /// （macOS 是 `~/cherry/`，Linux 是 `/mnt/`）。
     ///
-    /// 名字是给人读的（`ls ~/cherry` 一眼能认出来），那 8 位是防重名的：不同人发过来的
-    /// 篮子可能同名，而挂载命令是在**对方**机器上执行的，我们不知道他那儿挂了什么。
-    /// 篮子名允许哪些字符由 `basket::validate_basket_name` 管（它得能安全地进这行命令）。
+    /// 这段要进对方要粘的那行 shell 命令，所以名字得先**投影**成一个安全词：字母数字和
+    /// `-` `_` `.` 之外的一律换成 `-`。这样命令里一个引号都不用写，也不会漏掉哪个字符。
+    /// 篮子名本身不改——它就是文件名，你手打的、`ls` 里看到的，得是同一个东西。
+    ///
+    /// 那 8 位是防重名的：不同人发过来的篮子可能同名，而挂载命令是在**对方**机器上执行的，
+    /// 我们不知道他那儿挂了什么。投影之后撞名（`a b` 和 `a-b`）也靠它分开。
     ///
     /// 注意 **Finder 里显示的不是这个名字**：那用的是卷名，NFS 取的是导出路径的最后一段
     /// （也就是完整 id），改不了。
@@ -196,7 +199,7 @@ impl BasketLink {
         if basket_name.is_empty() {
             short.to_owned()
         } else {
-            format!("{basket_name}-{short}")
+            format!("{}-{short}", safe_leaf(basket_name))
         }
     }
 
@@ -327,6 +330,31 @@ fn broadcast_ipv4s() -> Vec<IpAddr> {
         libc::freeifaddrs(head);
     }
     out
+}
+
+/// 挂载点里那段名字投影成一个「合法词」：字母数字和 `-` `_` `.` 留着，其余一律换成
+/// 一个 `-`（连续的合成一个），两头多余的 `-` 剪掉。
+///
+/// 这段会被拼进对方要粘进 shell 的那行命令，所以这里按最严的字符集收一遍，命令里就一个
+/// 引号都不用写。投影完什么都不剩（名字全是符号）就退成 `basket`。
+fn safe_leaf(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut dash = false;
+    for c in name.chars() {
+        if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') {
+            out.push(c);
+            dash = false;
+        } else if !dash {
+            out.push('-');
+            dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "basket".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
 }
 
 /// 只看接口标志：这算不算一张“真网卡”。
@@ -497,6 +525,30 @@ mod tests {
         // 两个同名篮子靠短 id 分开。
         let other = BasketLink::new(sample().host, [8u8; 16]);
         assert_ne!(link.mountpoint_leaf("照片"), other.mountpoint_leaf("照片"));
+    }
+
+    /// 名字里什么都能有（它就等于文件名），但挂载点那段只能是安全字符——那行命令不带引号。
+    #[test]
+    fn 挂载点那段是投影过的安全词() {
+        let link = sample();
+        for (raw, want) in [
+            ("我的 照片", "我的-照片"),
+            ("a'b", "a-b"),
+            ("$(id)", "id"),
+            ("a  b", "a-b"),
+            ("--x--", "x"),
+            ("!!", "basket"),
+        ] {
+            let leaf = link.mountpoint_leaf(raw);
+            assert_eq!(leaf, format!("{want}-07070707"), "{raw}");
+        }
+        // 投影之后撞了名字也没事：后面那 8 位不一样。
+        let other = BasketLink::new(sample().host, [8u8; 16]);
+        assert_ne!(
+            link.mountpoint_leaf("a b"),
+            other.mountpoint_leaf("a-b"),
+            "投影撞名得靠短 id 分开"
+        );
     }
 
     #[test]

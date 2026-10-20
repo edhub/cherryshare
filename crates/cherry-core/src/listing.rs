@@ -15,7 +15,14 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::basket::{Basket, CherryKind};
+use crate::basket::Basket;
+
+/// 一棵树里的一项：普通文件还是真目录。符号链接、设备、fifo 都不是这两个，不进共享。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CherryKind {
+    File,
+    Dir,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
@@ -38,8 +45,8 @@ pub struct Entry {
 /// 列**一个**目录。`dir` 是篮子内的相对路径，空串表示篮子根（也就是 cherry 列表）。
 ///
 /// 篮子根这一层是唯一会把「引用失效」暴露成错误的地方：每颗 cherry 都要 `metadata`。
-/// 做法是**跳过**，不是让整层失败——一条死引用不该让整个篮子打不开。而摘掉那颗 cherry
-/// 是服务的事（[`crate::service::Service::prune_dead`]，ADR-0001），这里只管列。
+/// 做法是**跳过**，不是让整层失败——一条死引用不该让整个篮子打不开。文件里写着它、而源
+/// 已经没了，这种事由 `cherry show` 标出来（ADR-0008：工具不替你改文件）。
 ///
 /// **子目录不受影响**——这是按目录列带来的额外好处。
 pub fn list_dir(basket: &Basket, dir: &str) -> Result<Vec<Entry>> {
@@ -49,11 +56,11 @@ pub fn list_dir(basket: &Basket, dir: &str) -> Result<Vec<Entry>> {
         for cherry in &basket.cherries {
             match entry(&cherry.name, &cherry.source) {
                 Ok(Some(e)) => out.push(e),
-                // 不会是 `None`：`Basket::add` 已经把源规范化过、也拦过一道。真出现就
-                // 说明 `baskets.json` 被人手改了。
+                // 不会是 `None`：源路径在磁盘上是什么由列目录当场判；真出现就是文件里
+                // 那一行指到了符号链接之类的东西。
                 Ok(None) => tracing::warn!(cherry = %cherry.name, "不是普通文件也不是真目录，跳过"),
-                // 源没了。服务发现之后会把这颗摘掉（ADR-0001）；这里是刚删掉、还没来得及
-                // 摘的那一瞬。跳过就行——一条死引用不该把整层拖垮。
+                // 源没了。文件里还写着它，但那是你的文件，工具不替你改（ADR-0008）；跳过
+                // 就行——一条死引用不该把整层拖垮。
                 Err(e) => tracing::warn!(cherry = %cherry.name, "源的元数据读不到，跳过: {e:#}"),
             }
         }
@@ -205,12 +212,23 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cherry-listing-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub/deep")).unwrap();
+        // 云盘上 `/var` 是 `/private/var` 的符号链接：不 resolve 的话 `resolve` 会把
+        // 每一段都对不上。服务那头也是拿规范化过的路径进篮子的。
+        let dir = std::fs::canonicalize(&dir).unwrap();
         std::fs::write(dir.join("ok.txt"), b"x").unwrap();
         std::fs::write(dir.join("sub/two.bin"), b"yy").unwrap();
         std::fs::write(dir.join("sub/deep/three.bin"), b"zzz").unwrap();
 
-        let mut b = Basket::new("t").unwrap();
-        b.add(&dir).unwrap();
+        // 篮子在测试里不经过文件：直接造一份一样的东西（ADR-0008 之后 Basket 就是这些字段）。
+        let b = Basket {
+            id: [0u8; 16],
+            name: "t".into(),
+            file: dir.join("t.basket"),
+            cherries: vec![crate::basket::Cherry {
+                name: dir.file_name().unwrap().to_str().unwrap().to_owned(),
+                source: dir.clone(),
+            }],
+        };
         (b, dir)
     }
 
@@ -286,13 +304,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// 源没了：跳过它就行，别让一条死引用把整个篮子根变成错误。摘掉那颗是服务的事。
+    /// 源没了：跳过它就行，别让一条死引用把整个篮子根变成错误。文件里那一行不动
+    /// （ADR-0008：工具不替你改文件）。
     #[test]
     fn 根这一层跳过源没了的() {
         let (mut b, dir) = tree("deadroot");
         let dead = dir.join("dead.txt");
         std::fs::write(&dead, b"x").unwrap();
-        b.add(&dead).unwrap();
+        b.cherries.push(crate::basket::Cherry {
+            name: "dead.txt".into(),
+            source: dead.clone(),
+        });
         assert_eq!(list_dir(&b, "").unwrap().len(), 2);
 
         std::fs::remove_file(&dead).unwrap();

@@ -318,14 +318,8 @@ impl NFSFileSystem for BasketNfs {
                     listing::mtime_of(&meta),
                 ))
             }
-            // 篮子根没有磁盘对应物，但它也有一个真实的时间：篮子定义那个文件的 mtime。
-            None => Ok(Self::fattr(
-                id,
-                true,
-                Self::ROOT_MODE,
-                0,
-                self.svc.baskets_mtime(),
-            )),
+            // 篮子根没有磁盘对应物，但它也有一个真实的时间：定义它的那个文件的 mtime。
+            None => Ok(Self::fattr(id, true, Self::ROOT_MODE, 0, basket.mtime())),
         }
     }
 
@@ -374,12 +368,6 @@ impl NFSFileSystem for BasketNfs {
         max_entries: usize,
     ) -> Result<ReadDirResult, nfsstat3> {
         let (basket, sub) = self.target(dirid).await?;
-        // 列篮子根的时候顺手看一眼引用还指得着不，发现失效就摘掉（ADR-0001）。只做这一层：
-        // 子目录列目录是热路径，不该顺带 stat 每一颗 cherry。摘掉之后手里这份是旧的，
-        // `list_dir` 会把那颗跳过，列出来的结果一样。
-        if sub.is_empty() {
-            self.svc.prune_dead(&basket.id).await;
-        }
         let entries = Self::listing(&basket, &sub).await?;
 
         // 分页的 cookie 就是 fileid，所以子项必须按 fileid 有序。每次现排：目录不大，
@@ -532,7 +520,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cherry-nfs-fh-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let svc = Service::start(dir.clone()).await.unwrap();
-        let b = svc.create_basket("t").await.unwrap();
+        // 篮子就是数据目录里的一个文件（ADR-0008）。
+        std::fs::write(dir.join("t.basket"), "~/Pictures\n").unwrap();
+        let b = svc.basket("t").await.unwrap();
         let nfs = BasketNfs {
             svc: svc.clone(),
             ids: Mutex::new(Arena::default()),

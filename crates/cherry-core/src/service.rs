@@ -2,9 +2,10 @@
 //!
 //! 客户端只收集输入、呈现输出。合法性、路径规范化、冲突、状态机在这里做一次。
 //!
-//! **服务的全部持久状态就是 basket 配置。** 没有 identity key、没有 blobs store、
-//! 没有索引缓存——ADR-0007 决策六把它们一起删了。字节也不经过这里：创建者的服务把
-//! basket 讲成只读 NFS（见 `cherryd` 的 `nfs`），对方的**内核**直接读这台机器的磁盘。
+//! **持久状态就是数据目录里那几个 `.basket` 文件**（ADR-0008）。服务读它们、盯着它们的
+//! mtime，文件一变就重读；除了补一个缺失的 `id` 行，不往里面写任何东西。字节也不经过
+//! 这里：创建者的服务把 basket 讲成只读 NFS（见 `cherryd` 的 `nfs`），对方的**内核**直接
+//! 读这台机器的磁盘。
 
 use std::{
     path::{Path, PathBuf},
@@ -15,9 +16,12 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
-use crate::{basket::Basket, link::BasketLink};
+use crate::{
+    basket::{self, Basket},
+    link::BasketLink,
+};
 
 #[derive(Clone)]
 pub struct Service {
@@ -26,8 +30,10 @@ pub struct Service {
 
 struct Inner {
     data_dir: PathBuf,
-    /// 唯一的持久状态里，这份是「设计选择」而不是「OS 强制」（ADR-0003）。
-    baskets: RwLock<Vec<Basket>>,
+    state: RwLock<State>,
+    /// 重读这件事一次只许一个人做：两个请求同时发现「文件没 id」会各发一个 id，
+    /// 内存里留一个、文件里写一个，链接就对不上了。
+    refresh: Mutex<()>,
     /// NFS 导出那个监听起来了没有。`cherryd` 绑好（或绑失败）之后告诉服务。
     nfs_up: AtomicBool,
     http_up: AtomicBool,
@@ -37,22 +43,71 @@ impl std::fmt::Debug for Service {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Service")
             .field("data_dir", &self.inner.data_dir)
-            .field("baskets", &self.inner.baskets)
             .finish_non_exhaustive()
     }
 }
 
+/// 数据目录现在的内容：读得进来的、读不进来的，以及读的时候那些文件长什么样。
+pub struct Baskets {
+    /// 能用的篮子，按文件名排。
+    pub ok: Vec<Basket>,
+    /// 读不进来的文件。它们没有 id，所以别人的链接本来就指不到，只在 CLI 里露面。
+    pub broken: Vec<Broken>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Broken {
+    /// 文件名去掉 `.basket`。
+    pub name: String,
+    pub file: PathBuf,
+    pub error: String,
+}
+
+struct State {
+    baskets: Baskets,
+    /// 目录和每个篮子文件当时的 (mtime, 大小)。只要一个都没变就不重读。
+    dir: Option<Stamp>,
+    files: Vec<(PathBuf, Option<Stamp>)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    /// 纳秒。APFS 上够细，改一下就能看出来。
+    mtime: i128,
+    size: u64,
+}
+
+fn stamp_of(path: &Path) -> Option<Stamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as i128)
+        .unwrap_or(0);
+    Some(Stamp {
+        mtime,
+        size: meta.len(),
+    })
+}
+
 impl Service {
-    /// 起服务：建数据目录、读 basket 配置。
+    /// 起服务：建数据目录、把老格式迁过来、读一遍篮子。
     pub async fn start(data_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&data_dir)
             .with_context(|| format!("建不出数据目录 {}", data_dir.display()))?;
-        let baskets = load_baskets(&data_dir)?;
-        tracing::info!(baskets = baskets.len(), "cherryd 起来了");
+        migrate(&data_dir);
+        let state = load_all(&data_dir, &[]);
+        tracing::info!(
+            baskets = state.baskets.ok.len(),
+            broken = state.baskets.broken.len(),
+            "cherryd 起来了"
+        );
         Ok(Self {
             inner: Arc::new(Inner {
                 data_dir,
-                baskets: RwLock::new(baskets),
+                state: RwLock::new(state),
+                refresh: Mutex::new(()),
                 nfs_up: AtomicBool::new(false),
                 http_up: AtomicBool::new(false),
             }),
@@ -83,99 +138,37 @@ impl Service {
         self.inner.http_up.load(Ordering::Relaxed)
     }
 
-    pub async fn create_basket(&self, name: &str) -> Result<Basket> {
-        let mut baskets = self.inner.baskets.write().await;
-        if baskets.iter().any(|b| b.name == name) {
-            bail!("已经有一个叫 `{name}` 的 basket 了");
+    /// 现在数据目录里有什么。**每个请求都先过这儿**，文件改了就在这一刻跟上。
+    pub async fn baskets(&self) -> Baskets {
+        self.refresh().await;
+        let state = self.inner.state.read().await;
+        Baskets {
+            ok: state.baskets.ok.clone(),
+            broken: state.baskets.broken.clone(),
         }
-        let b = Basket::new(name)?;
-        baskets.push(b.clone());
-        drop(baskets);
-        self.persist().await?;
-        Ok(b)
     }
 
-    pub async fn add_cherry(&self, basket: &str, source: &Path) -> Result<crate::Cherry> {
-        let mut baskets = self.inner.baskets.write().await;
-        let b = baskets
-            .iter_mut()
-            .find(|b| b.name == basket)
-            .with_context(|| format!("没有叫 `{basket}` 的 basket"))?;
-        let cherry = b.add(source)?;
-        drop(baskets);
-        self.persist().await?;
-        Ok(cherry)
-    }
-
-    pub async fn remove_cherry(&self, basket: &str, name: &str) -> Result<crate::Cherry> {
-        let mut baskets = self.inner.baskets.write().await;
-        let b = baskets
-            .iter_mut()
-            .find(|b| b.name == basket)
-            .with_context(|| format!("没有叫 `{basket}` 的 basket"))?;
-        let cherry = b.remove(name)?;
-        drop(baskets);
-        self.persist().await?;
-        Ok(cherry)
-    }
-
-    /// 本机有哪些 basket。报出去之前先看一眼引用还指得着不（ADR-0001）。
-    pub async fn list_baskets(&self) -> Vec<Basket> {
-        let (out, removed) = {
-            let mut baskets = self.inner.baskets.write().await;
-            let removed: usize = baskets.iter_mut().map(prune_basket).sum();
-            (baskets.clone(), removed)
-        };
-        if removed > 0 {
-            self.persist_or_log().await;
-        }
-        out
-    }
-
+    /// 按篮子名取一个（就是文件名）。读不进来的文件把原因原样报出来。
     pub async fn basket(&self, name: &str) -> Result<Basket> {
-        // `show`、`link` 这些都经过这儿：报出去的该是现在的真相，不是刚加进来时的样子。
-        let id = self.basket_id(name).await?;
-        self.prune_dead(&id).await;
-        self.basket_by_id(&id).await
-    }
-
-    async fn basket_id(&self, name: &str) -> Result<[u8; 16]> {
-        self.inner
-            .baskets
-            .read()
-            .await
-            .iter()
-            .find(|b| b.name == name)
-            .map(|b| b.id)
-            .with_context(|| format!("没有叫 `{name}` 的 basket"))
-    }
-
-    /// 摘掉源已经没了的 cherry，返回摘掉几颗。
-    ///
-    /// 「失效」只认**确定不存在**：权限、IO、外置盘掉线之类可能是一时的，那种摘掉就再也
-    /// 回不来了，所以留着，只记一条日志。见 ADR-0001。
-    pub async fn prune_dead(&self, id: &[u8; 16]) -> usize {
-        let removed = {
-            let mut baskets = self.inner.baskets.write().await;
-            match baskets.iter_mut().find(|b| &b.id == id) {
-                Some(b) => prune_basket(b),
-                None => 0,
-            }
-        };
-        if removed > 0 {
-            self.persist_or_log().await;
+        let all = self.baskets().await;
+        if let Some(b) = all.ok.into_iter().find(|b| b.name == name) {
+            return Ok(b);
         }
-        removed
+        if let Some(b) = all.broken.iter().find(|b| b.name == name) {
+            bail!("{} 读不进来：{}", b.file.display(), b.error);
+        }
+        bail!(
+            "没有叫 `{name}` 的 basket（{} 里写个 {name}.basket 就有）",
+            self.inner.data_dir.display()
+        )
     }
 
     pub async fn basket_by_id(&self, id: &[u8; 16]) -> Result<Basket> {
-        self.inner
-            .baskets
-            .read()
+        self.baskets()
             .await
-            .iter()
+            .ok
+            .into_iter()
             .find(|b| &b.id == id)
-            .cloned()
             // 不泄漏「这个 id 存在但你没权限」这种区别（ADR-0007 决策二）。
             .context("这个 basket 不在我这儿")
     }
@@ -185,10 +178,12 @@ impl Service {
     ///
     /// 两条都给，因为发送方判不出对方在不在同一个广播域，挑哪条是对方那边的事
     /// （ADR-0002）。只有一条都算不出来的机器上才报错。
-    ///
-    /// "填哪个地址"只有这里判一次，不让每个客户端各自判一遍（ADR-0003）。
     pub async fn links(&self, basket: &str) -> Result<Vec<BasketLink>> {
-        let b = self.basket(basket).await?;
+        self.links_of(&self.basket(basket).await?)
+    }
+
+    /// 已经拿到篮子时直接算链接，不用再按名字查一遍。
+    pub fn links_of(&self, b: &Basket) -> Result<Vec<BasketLink>> {
         let hosts = crate::link::candidate_hosts();
         if hosts.is_empty() {
             bail!("这台机器上既没有本机名，也没有可用的局域网地址");
@@ -201,7 +196,10 @@ impl Service {
 
     /// 默认那一条：本机名优先，拿不到就退到 IP。网页那边没拿到 Host 头时用它。
     pub async fn link(&self, basket: &str) -> Result<BasketLink> {
-        let b = self.basket(basket).await?;
+        self.link_of(&self.basket(basket).await?)
+    }
+
+    pub fn link_of(&self, b: &Basket) -> Result<BasketLink> {
         let host = crate::link::candidate_hosts()
             .into_iter()
             .next()
@@ -209,59 +207,50 @@ impl Service {
         Ok(BasketLink::new(host, b.id))
     }
 
-    // ---- 持久化 ----
-
-    fn baskets_path(&self) -> PathBuf {
-        self.inner.data_dir.join("baskets.json")
-    }
-
-    /// 篮子定义那个文件的 mtime。
+    /// 文件变了就重读。
     ///
-    /// 这是给 NFS 用的：篮子根在磁盘上没有对应物，是个虚拟目录，但它得有一个**真的**
-    /// 时间。而「篮子的定义变了吗」是有对应物的——配置文件本身就是这件事的记录：
-    /// 增、删、改一颗 cherry 都会碰它，改文件内容不会（那是文件自己的 mtime 管的事）。
-    ///
-    /// 文件不存在就报 0（正常跑不到：能问到篮子根，说明那个篮子已经在配置里了）。
-    pub fn baskets_mtime(&self) -> u64 {
-        std::fs::metadata(self.baskets_path())
-            .map(|m| crate::listing::mtime_of(&m))
-            .unwrap_or(0)
-    }
-
-    /// 摘掉失效引用之后写盘。写不下去不能算了：内存里摘了、磁盘上还在，下次重起它又回来。
-    async fn persist_or_log(&self) {
-        if let Err(e) = self.persist().await {
-            tracing::error!("写回 baskets.json 失败，摘掉的那几颗下次重起还会回来: {e:#}");
+    /// 不用 inotify：几个 stat 比请求本身便宜，而且没有漏事件、FSEvents 合并这类边界要
+    /// 操心。「没人来问的时候热加载」本来也没有意义。
+    async fn refresh(&self) {
+        let _one_at_a_time = self.inner.refresh.lock().await;
+        let dir = stamp_of(&self.inner.data_dir);
+        {
+            let state = self.inner.state.read().await;
+            if state.dir == dir && state.files.iter().all(|(p, s)| stamp_of(p) == *s) {
+                return;
+            }
         }
-    }
-
-    async fn persist(&self) -> Result<()> {
-        let baskets = self.inner.baskets.read().await;
-        let json = serde_json::to_string_pretty(&*baskets)?;
-        let path = self.baskets_path();
-        // 写临时文件再 rename：断电也不会留下半个配置。
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
+        let previous = {
+            let state = self.inner.state.read().await;
+            state.baskets.ok.clone()
+        };
+        let fresh = load_all(&self.inner.data_dir, &previous);
+        *self.inner.state.write().await = fresh;
     }
 }
 
 /// 数据目录：服务的全部持久状态都在这儿（ADR-0003）。
+///
+/// `~/.config/cherryshare`，跟着 `XDG_CONFIG_HOME`。这不是**状态**而是你要手改的配置
+/// （ADR-0008），所以放配置目录、不跟着 `dirs::config_dir()` 走——macOS 上那是
+/// `~/Library/Application Support`，看不见、改起来难受。
 pub fn default_data_dir() -> Result<PathBuf> {
     if let Ok(d) = std::env::var("CHERRYSHARE_DATA_DIR")
         && !d.is_empty()
     {
         return Ok(PathBuf::from(d));
     }
-    let base = dirs::data_dir().context("找不到系统数据目录")?;
+    let base = match std::env::var("XDG_CONFIG_HOME") {
+        Ok(d) if !d.is_empty() => PathBuf::from(d),
+        _ => dirs::home_dir().context("找不到家目录")?.join(".config"),
+    };
     Ok(base.join("cherryshare"))
 }
 
 /// 网页文件放在哪儿。
 ///
-/// 跟数据目录分开：那边是**状态**（baskets.json、socket），这边是随包一起装的静态文件，
-/// 换页面不该碰到状态。位置跟着二进制走（`~/.local/`，跟 install.sh 装二进制的地方同源），
+/// 跟数据目录分开：那边是你写的篮子，这边是随包一起装的静态文件，换页面不该碰到篮子。
+/// 位置跟着二进制走（`~/.local/`，跟 install.sh 装二进制的地方同源），
 /// 所以 `CHERRYSHARE_WEB_DIR` 只是开发时指到仓库里构建产物的旋钮，不是给用户用的。
 pub fn default_web_dir() -> Result<PathBuf> {
     if let Ok(d) = std::env::var("CHERRYSHARE_WEB_DIR")
@@ -273,123 +262,324 @@ pub fn default_web_dir() -> Result<PathBuf> {
     Ok(home.join(".local/share/cherryshare/web"))
 }
 
-fn load_baskets(data_dir: &Path) -> Result<Vec<Basket>> {
-    let path = data_dir.join("baskets.json");
-    if !path.exists() {
-        return Ok(Vec::new());
+/// 读整个数据目录。一个文件读坏了只影响它自己：记一条日志、进错误表，别的照常。
+fn load_all(dir: &Path, previous: &[Basket]) -> State {
+    let mut state = State {
+        baskets: Baskets {
+            ok: Vec::new(),
+            broken: Vec::new(),
+        },
+        dir: stamp_of(dir),
+        files: Vec::new(),
+    };
+
+    let mut paths: Vec<PathBuf> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| is_basket_file(p))
+            .collect(),
+        Err(e) => {
+            state.baskets.broken.push(Broken {
+                name: dir.display().to_string(),
+                file: dir.to_path_buf(),
+                error: format!("读不了数据目录: {e}"),
+            });
+            return state;
+        }
+    };
+    paths.sort();
+
+    for path in paths {
+        state.files.push((path.clone(), stamp_of(&path)));
+        match basket::load(&path) {
+            Ok(b) => {
+                if let Some(old) = previous.iter().find(|o| o.file == path)
+                    && old.id != b.id
+                {
+                    tracing::warn!(
+                        basket = %b.name,
+                        old = %hex::encode(old.id), new = %hex::encode(b.id),
+                        "这个篮子的 id 变了（文件里的 id 行被删掉了？），发给别人的旧链接不再有效"
+                    );
+                }
+                state.baskets.ok.push(b);
+            }
+            Err(e) => {
+                let name = path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                tracing::error!(basket = %name, file = %path.display(), "篮子读不进来: {e:#}");
+                state.baskets.broken.push(Broken {
+                    name,
+                    file: path,
+                    error: format!("{e:#}"),
+                });
+            }
+        }
     }
-    let s = std::fs::read_to_string(&path).with_context(|| format!("读不到 {}", path.display()))?;
-    serde_json::from_str(&s).with_context(|| format!("{} 解析失败", path.display()))
+    state
 }
 
-/// 摘掉一个篮子里源已经没了的 cherry，返回摘掉几颗。
+/// 只认 `<名字>.basket`，且不以 `.` 开头——不然编辑器留下的 `.foo.basket.swp`、隐藏文件
+/// 也会被当成篮子。
+fn is_basket_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if name.starts_with('.') || !name.ends_with(basket::SUFFIX) {
+        return false;
+    }
+    let stem = &name[..name.len() - basket::SUFFIX.len()];
+    !stem.is_empty() && path.is_file()
+}
+
+/// ADR-0008 之前的那种 `baskets.json`：一次性拆成一个个 `.basket` 文件。
 ///
-/// **「失效」只认确定不存在**（`NotFound`）。权限、IO、外置盘掉线之类的错可能是一时的，
-/// 摘掉就回不来了——那种留着，只记日志，让下一次报错去说。
+/// 只在数据目录里一个 `.basket` 都没有的时候做，原文件改名留档、不删。
 ///
-/// 摘的时候喊一声，日志里带上把同一个路径加回来的命令：这条引用存在过的记录只剩它了。
-fn prune_basket(basket: &mut Basket) -> usize {
-    let name = basket.name.clone();
-    let before = basket.cherries.len();
-    basket.cherries.retain(|c| {
-        let gone = match std::fs::symlink_metadata(&c.source) {
-            Ok(meta) => crate::listing::servable(&meta).is_none(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-            Err(e) => {
-                tracing::warn!(
-                    basket = %name, cherry = %c.name, path = %c.source.display(),
-                    "源的元数据读不到，但这不像「没了」，先留着: {e}"
-                );
-                false
-            }
+/// 老的默认目录也看一眼——换了默认目录之后，篮子不能凭空消失。但**只在 `dir` 就是当前
+/// 默认数据目录时才看**：测试、e2e、第二个实例都用临时目录，它们不该把真正的那份
+/// `baskets.json` 搬到自己这儿来（也就不会把真正的文件改掉名）。
+fn migrate(dir: &Path) {
+    let has_baskets = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .any(|e| is_basket_file(&e.path()))
+        })
+        .unwrap_or(false);
+    if has_baskets {
+        return;
+    }
+
+    let mut candidates = vec![dir.join("baskets.json")];
+    // 「就是真安装时用的那个数据目录」：没通过环境变量指定（那是测试、e2e、第二个实例），
+    // 而且 `dir` 正是默认位置。两条都得满足。
+    let installed = std::env::var("CHERRYSHARE_DATA_DIR")
+        .map(|d| d.is_empty())
+        .unwrap_or(true)
+        && default_data_dir().ok().as_deref() == Some(dir);
+    if installed
+        && let Some(legacy) = dirs::data_dir().map(|d| d.join("cherryshare/baskets.json"))
+        && legacy.parent() != Some(dir)
+    {
+        candidates.push(legacy);
+    }
+
+    for json in candidates {
+        let Ok(text) = std::fs::read_to_string(&json) else {
+            continue;
         };
-        if gone {
-            tracing::warn!(
-                basket = %name, cherry = %c.name, path = %c.source.display(),
-                "源没了，把这颗 cherry 从篮子里摘掉。要放回来：cherry add {name} {}",
-                c.source.display()
-            );
+        match serde_json::from_str::<Vec<LegacyBasket>>(&text) {
+            Ok(baskets) => {
+                for b in &baskets {
+                    let file = dir.join(format!("{}{}", b.name, basket::SUFFIX));
+                    let mut body = String::from(
+                        "# 从 baskets.json 迁过来的（ADR-0008）。这个文件就是篮子的全部定义。\n",
+                    );
+                    body.push_str(&format!("id {}\n", hex::encode(b.id)));
+                    for c in &b.cherries {
+                        body.push_str(&format!("{}\n", c.source.display()));
+                    }
+                    if let Err(e) = std::fs::write(&file, body) {
+                        tracing::error!(file = %file.display(), "迁移写不进去: {e}");
+                    }
+                }
+                let kept = json.with_extension("json.migrated");
+                if let Err(e) = std::fs::rename(&json, &kept) {
+                    tracing::error!(file = %json.display(), "迁移完了，但原文件改不了名: {e}");
+                }
+                tracing::info!(
+                    baskets = baskets.len(),
+                    from = %json.display(), kept = %kept.display(),
+                    "把 baskets.json 拆成 .basket 文件了"
+                );
+            }
+            Err(e) => tracing::error!(file = %json.display(), "老的 baskets.json 解析不了: {e}"),
         }
-        !gone
-    });
-    before - basket.cherries.len()
+        // 迁一份就够：另一个候选位置多半不存在。
+        return;
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct LegacyBasket {
+    id: [u8; 16],
+    name: String,
+    cherries: Vec<LegacyCherry>,
+}
+
+#[derive(serde::Deserialize)]
+struct LegacyCherry {
+    source: PathBuf,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::basket::{Cherry, CherryKind};
     use crate::link::Host;
 
-    fn 引用(name: &str, source: &str) -> Cherry {
-        Cherry {
-            name: name.into(),
-            source: PathBuf::from(source),
-            kind: CherryKind::File,
+    fn tempdir(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("cherry-svc-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn write_basket(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let file = dir.join(format!("{name}.basket"));
+        std::fs::write(&file, body).unwrap();
+        file
+    }
+
+    #[tokio::test]
+    async fn 文件里写的篮子就是能用的篮子() {
+        let dir = tempdir("load");
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), b"x").unwrap();
+        write_basket(&dir, "t", &format!("# 说明\n{}/src\n", dir.display()));
+
+        let svc = Service::start(dir.clone()).await.unwrap();
+        let b = svc.basket("t").await.unwrap();
+        assert_eq!(b.name, "t");
+        assert_eq!(b.cherries.len(), 1);
+        assert_eq!(b.cherries[0].name, "src");
+        assert!(!svc.links("t").await.unwrap().is_empty());
+
+        // 换一个 Service 从头读：id 得一样（它落在文件里），篮子还在。
+        let again = Service::start(dir.clone()).await.unwrap();
+        assert_eq!(again.basket("t").await.unwrap().id, b.id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 文件是唯一真相：改了文件，不用重起就跟着变；删掉文件，篮子就没了。
+    #[tokio::test]
+    async fn 文件改了马上跟上() {
+        let dir = tempdir("hot");
+        let a = dir.join("a");
+        let b = dir.join("b");
+        for p in [&a, &b] {
+            std::fs::create_dir_all(p).unwrap();
         }
+        let file = write_basket(&dir, "t", &format!("{}\n", a.display()));
+        let svc = Service::start(dir.clone()).await.unwrap();
+        assert_eq!(svc.basket("t").await.unwrap().cherries[0].name, "a");
+
+        std::fs::write(&file, format!("{}\n{}\n", a.display(), b.display())).unwrap();
+        assert_eq!(svc.basket("t").await.unwrap().cherries.len(), 2);
+
+        std::fs::remove_file(&file).unwrap();
+        assert!(svc.basket("t").await.is_err(), "文件删了篮子就没了");
+        assert!(svc.baskets().await.ok.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn 确定没了才摘() {
-        let mut b = Basket::new("t").unwrap();
-        b.cherries.push(引用("x", "/no/such/thing"));
-        assert_eq!(prune_basket(&mut b), 1);
-        assert!(b.cherries.is_empty());
+    /// 一个文件读坏了只影响它自己，原因原样报给 `cherry show`。
+    #[tokio::test]
+    async fn 坏文件进错误表_别的照常() {
+        let dir = tempdir("broken");
+        write_basket(&dir, "好的", "~/Pictures\n");
+        write_basket(&dir, "坏的", "./相对路径\n");
+        std::fs::write(dir.join("notes.txt"), "不是篮子").unwrap();
+        std::fs::write(dir.join(".隐藏.basket"), "~/x\n").unwrap();
+
+        let svc = Service::start(dir.clone()).await.unwrap();
+        let all = svc.baskets().await;
+        assert_eq!(all.ok.len(), 1);
+        assert_eq!(all.ok[0].name, "好的");
+        assert_eq!(all.broken.len(), 1);
+        assert_eq!(all.broken[0].name, "坏的");
+        assert!(
+            all.broken[0].error.contains("第 1 行"),
+            "{}",
+            all.broken[0].error
+        );
+
+        let err = svc.basket("坏的").await.unwrap_err().to_string();
+        assert!(err.contains("读不进来"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 读元数据时的错不都是「没了」：权限、IO 这类可能是一时的，摘掉就回不来。
-    /// `/etc/hosts/x` 拿到的是 `ENOTDIR`——那是个确定的错，但不是「源没了」。
-    #[test]
-    fn 一时的错误不算失效() {
-        let mut b = Basket::new("t").unwrap();
-        b.cherries.push(引用("x", "/etc/hosts/deeper"));
-        assert_eq!(prune_basket(&mut b), 0);
-        assert_eq!(b.cherries.len(), 1, "不该摘掉");
+    /// 源没了不再写回文件（ADR-0008）：文件是你的，工具只读。列目录照样跳过它。
+    #[tokio::test]
+    async fn 源没了不写回文件() {
+        let dir = tempdir("gone");
+        let gone = dir.join("gone");
+        std::fs::create_dir_all(&gone).unwrap();
+        let file = write_basket(&dir, "t", &format!("{}\n", gone.display()));
+        let svc = Service::start(dir.clone()).await.unwrap();
+        svc.basket("t").await.unwrap();
+
+        std::fs::remove_dir_all(&gone).unwrap();
+        let b = svc.basket("t").await.unwrap();
+        assert_eq!(b.cherries.len(), 1, "内存里也留着，只有列目录的时候跳过");
+        assert!(crate::listing::list_dir(&b, "").unwrap().is_empty());
+
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            text.contains(&gone.display().to_string()),
+            "文件不该被改：{text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn 老的_baskets_json_会拆成文件() {
+        let dir = tempdir("migrate");
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let json = serde_json::json!([{
+            "id": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7],
+            "name": "老篮子",
+            "cherries": [{"name": "src", "source": src.to_string_lossy(), "kind": "Dir"}],
+        }]);
+        std::fs::write(dir.join("baskets.json"), json.to_string()).unwrap();
+
+        let svc = Service::start(dir.clone()).await.unwrap();
+        let b = svc.basket("老篮子").await.unwrap();
+        assert_eq!(b.id, [7u8; 16]);
+        assert_eq!(b.cherries.len(), 1);
+        assert!(dir.join("baskets.json.migrated").exists(), "原文件留档");
+        assert!(!dir.join("baskets.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 名字那条和 IP 那条都得在，而且是名字在前（ADR-0002）。
     #[tokio::test]
     async fn 链接给名字和_ip_两条() {
-        let data = std::env::temp_dir().join(format!("cherry-link-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&data);
-        let svc = Service::start(data.clone()).await.unwrap();
-        svc.create_basket("t").await.unwrap();
+        let dir = tempdir("links");
+        write_basket(&dir, "t", "~/Pictures\n");
+        let svc = Service::start(dir.clone()).await.unwrap();
 
         let links = svc.links("t").await.unwrap();
         assert!(!links.is_empty(), "总得给人一条");
 
         // 本机没有对外地址的机器（容器之类）上就只有名字那条，那就没得比。
         let (Ok(ip), Some(name)) = (crate::link::lan_addr(), crate::link::local_hostname()) else {
+            let _ = std::fs::remove_dir_all(&dir);
             return;
         };
         assert_eq!(links[0].host, name, "名字在前");
         assert_eq!(links[1].host, Host::Ip(ip), "IP 在后");
-        // 默认那条就是第一条。
         assert_eq!(svc.link("t").await.unwrap().host, name);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 源没了：报出去的篮子里就不该再有它，而且磁盘上也得落下来（不然重起又回来了）。
-    #[tokio::test]
-    async fn 摘掉源没了的引用并落盘() {
-        let data = std::env::temp_dir().join(format!("cherry-svc-{}", std::process::id()));
-        let src = data.join("src");
-        let _ = std::fs::remove_dir_all(&data);
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join("a.txt"), b"x").unwrap();
-
-        let svc = Service::start(data.clone()).await.unwrap();
-        svc.create_basket("t").await.unwrap();
-        svc.add_cherry("t", &src).await.unwrap();
-        assert_eq!(svc.basket("t").await.unwrap().cherries.len(), 1);
-
-        std::fs::remove_dir_all(&src).unwrap();
-        assert!(svc.basket("t").await.unwrap().cherries.is_empty());
-        assert!(svc.list_baskets().await[0].cherries.is_empty());
-
-        // 换一个 Service 从头读盘：摘掉这件事得是持久的。
-        let again = Service::start(data.clone()).await.unwrap();
-        assert!(again.basket("t").await.unwrap().cherries.is_empty());
-
-        let _ = std::fs::remove_dir_all(&data);
+    #[test]
+    fn 数据目录跟着_xdg_config_home() {
+        // 这个测试只验证拼法：环境变量全局共享，改它得小心，所以用子 shell 语义的那套不了，
+        // 直接验「不带 XDG 时是 ~/.config/cherryshare」这一半。
+        if std::env::var("XDG_CONFIG_HOME").is_err()
+            && std::env::var("CHERRYSHARE_DATA_DIR").is_err()
+        {
+            let home = dirs::home_dir().unwrap();
+            assert_eq!(
+                default_data_dir().unwrap(),
+                home.join(".config/cherryshare")
+            );
+        }
     }
 }
