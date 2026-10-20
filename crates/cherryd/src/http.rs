@@ -208,6 +208,8 @@ async fn list_json(
 
     let res = Json(ListJson {
         name: basket.name.clone(),
+        // 页面上「XX 分享给你的篮子」里的那个 XX。不是篮子名，是这台机器的主人。
+        owner: app.svc.owner().await,
         id: link.basket_id_hex(),
         link: link.to_string(),
         host: HostJson::from_host(&link.host),
@@ -548,6 +550,8 @@ fn plain_inner(status: StatusCode, msg: &str) -> Response {
 #[derive(Serialize)]
 struct ListJson {
     name: String,
+    /// 分享者的名字，显示在页面标题上（`config.toml` 里的 `name`，缺省是主机名）。
+    owner: String,
     id: String,
     link: String,
     host: HostJson,

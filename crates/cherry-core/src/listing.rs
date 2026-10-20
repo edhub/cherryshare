@@ -75,7 +75,7 @@ pub enum Resolved {
 ///
 /// 虚拟目录这一层会把「引用失效」暴露成错误的地方：每颗 cherry 都要 `metadata`。
 /// 做法是**跳过**，不是让整层失败——一条死引用不该让整个篮子打不开。文件里写着它、而源
-/// 已经没了，这种事由 `cherry show` 标出来（ADR-0008：工具不替你改文件）。
+/// 已经没了，这种事由 `cherry list` 标出来（ADR-0008：工具不替你改文件）。
 ///
 /// **子目录不受影响**——这是按目录列带来的额外好处。
 pub fn list_dir(basket: &Basket, dir: &str) -> Result<Vec<Entry>> {

@@ -20,6 +20,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::{
     basket::{self, Basket},
+    config::Config,
     link::BasketLink,
 };
 
@@ -37,6 +38,8 @@ struct Inner {
     /// NFS 导出那个监听起来了没有。`cherryd` 绑好（或绑失败）之后告诉服务。
     nfs_up: AtomicBool,
     http_up: AtomicBool,
+    /// `config.toml`。跟篮子各自独立热加载，理由见 `refresh`。
+    config: RwLock<ConfigState>,
 }
 
 impl std::fmt::Debug for Service {
@@ -63,11 +66,62 @@ pub struct Broken {
     pub error: String,
 }
 
+/// `cherry status` 里的配置那几行（ADR-0010）。
+pub struct ConfigView {
+    /// `config.toml` 的完整路径，好让人知道该改哪个文件。
+    pub file: PathBuf,
+    /// 现在生效的名字（配置里没有就是主机名）。
+    pub name: String,
+    /// 上一次读失败的原因。读坏了的时候生效的还是上一份。
+    pub error: Option<String>,
+}
+
 struct State {
     baskets: Baskets,
     /// 目录和每个篮子文件当时的 (mtime, 大小)。只要一个都没变就不重读。
     dir: Option<Stamp>,
     files: Vec<(PathBuf, Option<Stamp>)>,
+}
+
+/// `config.toml` 的内存副本，以及上一次读成什么样。
+#[derive(Default)]
+struct ConfigState {
+    config: Config,
+    /// 上一次读失败的原因。读坏了**保留上一次的好配置**，见 `reload`。
+    error: Option<String>,
+    /// 上次读的时候文件长什么样。`None` 是「文件不在」，跟默认配置是一回事
+    /// （`stamp_of` 对不存在的文件也给 None，所以启动时那一次会直接跳过）。
+    stamp: Option<Stamp>,
+}
+
+impl ConfigState {
+    /// 文件变了就重读一遍。没变就什么都不做——每个请求都会走到这儿。
+    fn reload(&mut self, dir: &Path) {
+        let path = Config::path(dir);
+        let stamp = stamp_of(&path);
+        if self.stamp == stamp {
+            return;
+        }
+        self.stamp = stamp;
+        match Config::load(&path) {
+            Ok(config) => {
+                if config.name != self.config.name {
+                    tracing::info!(
+                        name = config.name.as_deref().unwrap_or("（主机名）"),
+                        "配置里的名字换了"
+                    );
+                }
+                self.config = config;
+                self.error = None;
+            }
+            Err(e) => {
+                // 保留上一份好配置，不退回主机名：改名出错的瞬间，对方看到的应该是旧名字，
+                // 而不是看起来像服务挂了一样的默认名字。
+                tracing::error!(file = %path.display(), "配置读不进来，还在用上一份: {e:#}");
+                self.error = Some(format!("{e:#}"));
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -98,9 +152,12 @@ impl Service {
             .with_context(|| format!("建不出数据目录 {}", data_dir.display()))?;
         migrate(&data_dir);
         let state = load_all(&data_dir, &[]);
+        let mut config = ConfigState::default();
+        config.reload(&data_dir);
         tracing::info!(
             baskets = state.baskets.ok.len(),
             broken = state.baskets.broken.len(),
+            name = config.config.name.as_deref().unwrap_or("（主机名）"),
             "cherryd 起来了"
         );
         Ok(Self {
@@ -110,6 +167,7 @@ impl Service {
                 refresh: Mutex::new(()),
                 nfs_up: AtomicBool::new(false),
                 http_up: AtomicBool::new(false),
+                config: RwLock::new(config),
             }),
         })
     }
@@ -145,6 +203,24 @@ impl Service {
         Baskets {
             ok: state.baskets.ok.clone(),
             broken: state.baskets.broken.clone(),
+        }
+    }
+
+    /// 对方打开页面时看到的名字。
+    pub async fn owner(&self) -> String {
+        self.refresh().await;
+        let name = self.inner.config.read().await.config.name.clone();
+        name.unwrap_or_else(hostname_or_product)
+    }
+
+    /// 给 `cherry status`：文件在哪、生效的是什么、上次读有没有出错。
+    pub async fn config_view(&self) -> ConfigView {
+        self.refresh().await;
+        let c = self.inner.config.read().await;
+        ConfigView {
+            file: Config::path(&self.inner.data_dir),
+            name: c.config.name.clone().unwrap_or_else(hostname_or_product),
+            error: c.error.clone(),
         }
     }
 
@@ -207,12 +283,17 @@ impl Service {
         Ok(BasketLink::new(host, b.id))
     }
 
-    /// 文件变了就重读。
+    /// 文件变了就重读。配置和篮子各自独立：谁变了就重读谁。
     ///
     /// 不用 inotify：几个 stat 比请求本身便宜，而且没有漏事件、FSEvents 合并这类边界要
     /// 操心。「没人来问的时候热加载」本来也没有意义。
+    ///
+    /// 不做 `cherry reload` 的理由也在这儿（ADR-0010）：改完 `config.toml`，下一个请求
+    /// 就是新的名字，多一个显式命令只是多一条要维护的路径。
     async fn refresh(&self) {
         let _one_at_a_time = self.inner.refresh.lock().await;
+        // 先看配置：它只有一项，读起来便宜，而且大部分时候这里就是一次 stat。
+        self.inner.config.write().await.reload(&self.inner.data_dir);
         let dir = stamp_of(&self.inner.data_dir);
         {
             let state = self.inner.state.read().await;
@@ -230,6 +311,9 @@ impl Service {
 }
 
 /// 数据目录：服务的全部持久状态都在这儿（ADR-0003）。
+///
+/// 里面是两种东西：你写的篮子（`<名字>.basket`，ADR-0008）和 `config.toml`
+/// （ADR-0010，目前只有一项 `name`）。
 ///
 /// `~/.config/cherryshare`，跟着 `XDG_CONFIG_HOME`。这不是**状态**而是你要手改的配置
 /// （ADR-0008），所以放配置目录、不跟着 `dirs::config_dir()` 走——macOS 上那是
@@ -320,6 +404,17 @@ fn load_all(dir: &Path, previous: &[Basket]) -> State {
         }
     }
     state
+}
+
+/// 配置里没写名字时用什么：主机名的第一段。
+///
+/// `edh的MacBookPro.local` → `edh的MacBookPro`。`.local` 是 mDNS 后缀，留在页面上
+/// 只会让对方问那是什么。连主机名都拿不到（容器里常见）才退回产品名。
+fn hostname_or_product() -> String {
+    match crate::link::local_hostname() {
+        Some(crate::link::Host::Name(n)) => n.split('.').next().unwrap_or(n.as_str()).to_owned(),
+        _ => "CherryShare".to_owned(),
+    }
 }
 
 /// 只认 `<名字>.basket`，且不以 `.` 开头——不然编辑器留下的 `.foo.basket.swp`、隐藏文件
@@ -477,7 +572,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 一个文件读坏了只影响它自己，原因原样报给 `cherry show`。
+    /// 一个文件读坏了只影响它自己，原因原样报给 `cherry list`。
     #[tokio::test]
     async fn 坏文件进错误表_别的照常() {
         let dir = tempdir("broken");

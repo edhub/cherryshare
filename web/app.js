@@ -498,8 +498,12 @@ async function load(path = "") {
     return;
   }
   const data = await res.json();
-  document.title = `${data.name} — CherryShare`;
+  // 名字是用户在 config.toml 里写的自由文本，一律走 textContent：写个
+  // `<img onerror=...>` 就能在这台内网 http 服务上执行脚本，而访问者是别人。
+  const owner = data.owner || "CherryShare";
+  document.title = `${data.name} — ${owner}`;
   document.getElementById("basket").textContent = data.name;
+  document.getElementById("owner").textContent = owner;
 
   mounts = data.mounts;
   host = data.host;

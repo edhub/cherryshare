@@ -4,6 +4,7 @@
 //! 状态机。客户端（CLI）只收集输入、呈现输出，不重复这些判断。见 ADR-0003。
 
 pub mod basket;
+pub mod config;
 pub mod link;
 pub mod listing;
 pub mod service;

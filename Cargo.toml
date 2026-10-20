@@ -26,6 +26,9 @@ license = "MIT OR Apache-2.0"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# 数据目录里那份 `config.toml`（ADR-0010）。手写的东西要能写注释、能 diff，
+# 而且端口、开关这类值天生有类型，不该自己发明语法。
+toml = "1"
 postcard = { version = "1", features = ["use-std"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }

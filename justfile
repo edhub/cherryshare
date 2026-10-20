@@ -88,14 +88,15 @@ e2e:
     # 后面三条带 `/./`：篮子根上长出 agent/，中间层是虚拟目录，wan 是叶子上的真目录。
     printf '# e2e\n%s\n%s/./agent/APPEND_SYSTEM.md\n%s/./agent/extensions/llm-timer.ts\n%s/./agent/skills/wan\n' \
         "$SRC" "$TREE" "$TREE" "$TREE" >"$D/t.basket"
-    cherry show t
+    cherry list
     grep -q '^id [0-9a-f]\{32\}$' "$D/t.basket" || { echo "没补 id ✗" >&2; exit 1; }
     head -1 "$D/t.basket" | grep -q '^# e2e$' || { echo "说明被冲掉了 ✗" >&2; exit 1; }
 
     WID=$(grep -o '^id [0-9a-f]\{32\}' "$D/t.basket" | cut -d' ' -f2)
     W="http://127.0.0.1:20480"
-    # 一个篮子一小段：头上是名字，下面两条链接（名字一条、IP 一条）。
-    URLS=$(cherry list | grep -o 'http://[^ ]*')
+    # 一个篮子一段：文件原文、读不到的路径、然后两条链接（名字一条、IP 一条）。
+    # 只抓 `/b/<id>/` 那一种：文件原文里万一有 `http://` 不该被当成链接。
+    URLS=$(cherry list | grep -o "http://[^ ]*/b/[0-9a-f]\{32\}/" | head -2)
     LINK=$(echo "$URLS" | sed -n 1p)
     echo "链接 $LINK"
     case "$LINK" in
@@ -262,7 +263,7 @@ e2e:
     [ "$code" = "400" ] || { echo "算大小不给 path 该是 400，得到 $code ✗" >&2; exit 1; }
 
     # 源没了：挂载点根目录照常列（不是整层失败）、日志留一条；但文件是你的，工具不替你改
-    # （ADR-0008）——那一行还在，`cherry show` 得把它标出来。
+    # （ADR-0008）——那一行还在，`cherry list` 得把它标出来。
     # 先把 `/./` 那几条摘掉，这一节只看 share：虚拟目录的壳在叶子都没了之后还会留着，
     # 那是另一条语义，别混进这个断言。
     grep -v "$TREE" "$D/t.basket" >"$D/t.tmp" && mv "$D/t.tmp" "$D/t.basket"
@@ -273,7 +274,7 @@ e2e:
         exit 1
     fi
     [ -z "$LEFT" ] || { echo "摘掉之后根目录里还剩东西 ✗: $LEFT" >&2; exit 1; }
-    cherry show t | grep -q "源不在了" || { echo "show 没标出源不在了 ✗" >&2; exit 1; }
+    cherry list | grep -q "源不在了" || { echo "list 没标出源不在了 ✗" >&2; exit 1; }
     grep -qx "$SRC" "$D/t.basket" || { echo "工具擅自改了你的篮子文件 ✗" >&2; exit 1; }
     grep -q "源的元数据读不到" "$D/log" || { echo "日志里没有那条 ✗" >&2; exit 1; }
 
@@ -281,7 +282,7 @@ e2e:
     rm "$D/t.basket"
     code=$(curl -s -o /dev/null -w '%{http_code}' "$W/b/$WID/")
     [ "$code" = "404" ] || { echo "删掉篮子之后旧链接还能用 ✗: $code" >&2; exit 1; }
-    if cherry show t >/dev/null 2>&1; then echo "篮子还在 ✗" >&2; exit 1; fi
+    if cherry list | grep -q "t.basket"; then echo "篮子还在 ✗" >&2; exit 1; fi
 
     echo "✓ 端到端通过：内容一致、符号链接没出来、写不进去、虚拟目录能进能取能打包、源没了之后连坐没有发生、网页那条路通、打包能解开、目录大小算得对且有预算、删篮子之后旧链接打不开"
 # 出一个版本。参数必须跟 Cargo.toml 里的版本一致。

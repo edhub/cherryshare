@@ -7,7 +7,7 @@
 //! （ADR-0008）。所以这个程序不需要知道你的 cwd，也不需要把路径变成绝对路径。
 
 use anyhow::{Result, bail};
-use cherry_control::{BasketView, BrokenView, Client, LinkSet, Request, Response};
+use cherry_control::{BasketView, BrokenView, Client, Request, Response};
 use cherry_core::BasketLink;
 use cherry_core::link::Host;
 use clap::{CommandFactory, Parser, Subcommand};
@@ -29,13 +29,8 @@ struct Cli {
 enum Cmd {
     /// 服务状态
     Status,
-    /// 列出本机所有 basket，每个都给出要发给对方的网页链接——本机名一条、IP 一条
+    /// 列出所有篮子：每个的文件原文、哪几行现在读不到，以及要发给对方的网页链接
     List,
-    /// 把一个 basket 文件原样打出来，顺带说哪几行现在读不到；不给篮子就全打
-    Show {
-        /// 篮子名（就是数据目录里那个文件名，去掉 .basket）。不给我就全看
-        basket: Option<String>,
-    },
 }
 
 #[tokio::main]
@@ -74,15 +69,12 @@ async fn main() -> Result<()> {
 fn to_request(cmd: Cmd) -> Request {
     match cmd {
         Cmd::Status => Request::Status,
-        Cmd::List => Request::Links,
-        Cmd::Show { basket } => match basket {
-            Some(name) => Request::ShowBasket { name },
-            None => Request::ListBaskets,
-        },
+        Cmd::List => Request::List,
     }
 }
 
-/// `cherry show` 不带给篮子时也是每颗都给详情——反正它问的就是「里面有什么」。
+/// 一个命令就是全部：文件原文 + 读不到的路径 + 链接。不再有「只看某一个」的第二个
+/// 命令——列表里每一段都带文件路径，找一颗篮子就是扫一眼的事。
 fn print(resp: Response) {
     match resp {
         Response::Error(_) => {}
@@ -94,8 +86,20 @@ fn print(resp: Response) {
             nfs_up,
             http_port,
             http_up,
+            config_file,
+            owner,
+            config_error,
         } => {
-            println!("data       {}", data_dir.display());
+            println!("data       {}", tilde(&data_dir));
+            println!("config     {}", tilde(&config_file));
+            println!("name       {owner}");
+            // 读坏了要说清楚：这时候页面上那个名字是上一份，不是你刚写的那份。
+            if let Some(e) = config_error {
+                println!("           读不进来，页面上还是上一份：");
+                for line in e.lines() {
+                    println!("             {line}");
+                }
+            }
             println!(
                 "baskets    {baskets}{}",
                 if broken > 0 {
@@ -123,31 +127,30 @@ fn print(resp: Response) {
             );
         }
         Response::Baskets { dir, ok, broken } => {
-            print_empty_hint(&dir, ok.is_empty() && broken.is_empty());
+            let empty = ok.is_empty() && broken.is_empty();
+            print_empty_hint(&dir, empty);
+            // 目录只打一次：段头只给文件名，不然同样的前缀在每段重复一遍。
+            if !empty {
+                println!("data      {}", tilde(&dir));
+                println!();
+            }
             for (i, b) in ok.iter().enumerate() {
                 if i > 0 {
                     println!();
                 }
-                print_basket(b, true);
+                print_basket(b);
             }
             print_broken(&broken);
         }
-        Response::Basket(b) => print_basket(&b, false),
-        // 一个篮子一小段：头上是名字和里面有几样东西，下面两条链接——本机名一条、IP 一条。
-        // 两条一起摆出来是因为发送方判不出对方在不在同一个广播域（ADR-0002）：名字过不了
-        // 路由和隧道，IP 这边一换 DHCP 地址就废了。URL 由它现场拼，这一步跟以前拼挂载命令
-        // 是同一件事，纯粹是格式。
-        // 挂载命令不在这儿打了：页面上有，而且那份是按对方自己的系统给的，比这边猜的准。
-        Response::Links { dir, sets, broken } => {
-            print_empty_hint(&dir, sets.is_empty() && broken.is_empty());
-            for (i, set) in sets.iter().enumerate() {
-                if i > 0 {
-                    println!();
-                }
-                print_links(set);
-            }
-            print_broken(&broken);
-        }
+    }
+}
+
+/// 家目录写成 `~`：数据目录和配置文件路径几乎都以它开头，绝对路径白白吃掉一截版面。
+/// 只用在给人看的输出里，程序里该用完整路径的地方照旧。
+fn tilde(path: &std::path::Path) -> String {
+    match dirs::home_dir().and_then(|home| path.strip_prefix(home).ok().map(|p| p.to_owned())) {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
     }
 }
 
@@ -156,20 +159,17 @@ fn print_empty_hint(dir: &std::path::Path, empty: bool) {
     if empty {
         println!(
             "（还没有 basket。在 {} 里写个 <名字>.basket，一行一条要分享的路径，以 ~/ 开头或写绝对路径；\n  想在篮子里保留目录，就写成 `前缀/./可见/路径`）",
-            dir.display()
+            tilde(dir)
         );
     }
 }
 
-fn print_links(set: &LinkSet) {
-    println!("{}（{} 项）  {}", set.name, set.items, set.file);
-    for raw in &set.links {
-        match raw.parse::<BasketLink>() {
-            Ok(link) => println!("  {}  {}", 地址种类(&link.host), link.web_url()),
-            // 解析不了就照原样打出来，别把服务给的东西吞掉。
-            Err(_) => println!("  {raw}"),
-        }
-    }
+/// 路径的最后一段。`/a/b/x.basket` → `x.basket`。
+fn file_name(path: &str) -> &str {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path)
 }
 
 /// 读不进来的文件单独一段，原因照原文给：那个人得知道去改哪一行。
@@ -194,15 +194,11 @@ fn 地址种类(host: &Host) -> &'static str {
     }
 }
 
-/// 原样打文件内容。要看的就这一份东西：文件是唯一真相（ADR-0008），它长什么样就打成
-/// 什么样，你写的注释也在里面，`id` 那行本来就在里面，不用再抄一遍。
-///
-/// 几个篮子一起打的时候才加一行 `==> 文件 <==`（跟 `head` 一个约定）：不然分不出哪段是
-/// 哪个文件的。单个篮子不加：那条路径就在上面那句里，重复一遍没意思。
-fn print_basket(b: &BasketView, with_header: bool) {
-    if with_header {
-        println!("==> {} <==", b.file);
-    }
+/// 一段一个篮子：`==> 文件名 <==` 开头；段头只给文件名（数据目录在上面打过一行），
+/// 然后是文件原文（文件是唯一真相，ADR-0008，它长什么样就打成什么样，注释和 `id` 行
+/// 本来就在里面），接着是读不到的路径，最后是链接。
+fn print_basket(b: &BasketView) {
+    println!("==> {} <==", file_name(&b.file));
     print!("{}", b.content);
     if !b.content.is_empty() && !b.content.ends_with('\n') {
         println!();
@@ -214,6 +210,21 @@ fn print_basket(b: &BasketView, with_header: bool) {
         println!();
         for m in &b.missing {
             println!("  读不到：{m}");
+        }
+    }
+    println!();
+    // 两条链接一起摆出来：发送方判不出对方在不在同一个广播域（ADR-0002），名字过不了
+    // 路由和隧道，IP 这边一换 DHCP 地址就废了。挂载命令不在这儿打：页面上有，而且那份
+    // 是按对方自己的系统给的。
+    if b.links.is_empty() {
+        println!("  这台机器既没有本机名也没有可用的局域网地址，链接算不出来");
+        return;
+    }
+    for raw in &b.links {
+        match raw.parse::<BasketLink>() {
+            Ok(link) => println!("  {}  {}", 地址种类(&link.host), link.web_url()),
+            // 解析不了就照原样打出来，别把服务给的东西吞掉。
+            Err(_) => println!("  {raw}"),
         }
     }
 }
@@ -230,21 +241,19 @@ mod tests {
     }
 
     #[test]
-    fn show_不带篮子也行_list_不收地址() {
-        let cli = Cli::try_parse_from(["cherry", "show"]).unwrap();
-        assert!(matches!(cli.cmd, Some(Cmd::Show { basket: None })));
-
-        // list 自己把名字和 IP 两条都列出来，不再收地址参数。
+    fn list_不收参数() {
+        // 一个命令就是全部：不再有「只看某一个篮子」的第二个命令，也不收地址参数。
         let cli = Cli::try_parse_from(["cherry", "list"]).unwrap();
         assert!(matches!(cli.cmd, Some(Cmd::List)));
         assert!(Cli::try_parse_from(["cherry", "list", "--ip"]).is_err());
         assert!(Cli::try_parse_from(["cherry", "list", "--host", "10.0.0.1"]).is_err());
+        assert!(Cli::try_parse_from(["cherry", "list", "t"]).is_err());
     }
 
     /// 写入口撤了（ADR-0008）：建篮子、加东西、删东西都是改文件，这里不该再有命令。
     #[test]
     fn 只留读命令() {
-        for gone in ["new", "add", "rm", "delete"] {
+        for gone in ["new", "add", "rm", "delete", "show"] {
             assert!(
                 Cli::try_parse_from(["cherry", gone, "x"]).is_err(),
                 "{gone} 该没了"

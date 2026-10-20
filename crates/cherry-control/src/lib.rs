@@ -30,15 +30,9 @@ pub fn socket_path(data_dir: &Path) -> PathBuf {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
     Status,
-    /// 每个篮子的详情（`cherry show` 不给名字的时候）。
-    ListBaskets,
-    ShowBasket {
-        name: String,
-    },
-    /// 每个篮子每个地址一条网页链接——本机名一条，IP 一条（见
-    /// `cherry_core::Service::links`）。挂载命令不在这儿给，它在页面上，
-    /// 而且是按对方自己的系统给的（ADR-0002）。
-    Links,
+    /// 全部篮子：每个的文件原文、哪几行读不到，以及它能发出去的链接。
+    /// 没有「只看某一个」——`cherry list` 就是全部。
+    List,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,17 +48,17 @@ pub enum Response {
         /// 网页那条路的端口。`http_up` 为假说明页面点不开。
         http_port: u16,
         http_up: bool,
+        /// `config.toml` 的路径。改名字就改这个文件，改完不用重启（ADR-0010）。
+        config_file: PathBuf,
+        /// 现在生效的名字（对方打开页面看到的就是它）。
+        owner: String,
+        /// 上一次读 `config.toml` 出错的原因。这时生效的是上一份好配置。
+        config_error: Option<String>,
     },
     Baskets {
         /// 没东西可看的时候得告诉人去哪儿写文件。
         dir: PathBuf,
         ok: Vec<BasketView>,
-        broken: Vec<BrokenView>,
-    },
-    Basket(BasketView),
-    Links {
-        dir: PathBuf,
-        sets: Vec<LinkSet>,
         broken: Vec<BrokenView>,
     },
     Error(String),
@@ -76,34 +70,26 @@ pub struct BasketView {
     pub id: String,
     /// 定义这个篮子的文件。要改篮子就是去改它。
     pub file: String,
-    /// 文件原文。`cherry show` 就是把它打出来——文件是唯一真相，没必要再翻译一遍。
+    /// 文件原文。打出来就是它——文件是唯一真相，没必要再翻译一遍。
     pub content: String,
     /// 文件里写着、但现在读不到的路径（带原因）。这是唯一一处「算出来的东西」：
     /// 有人看的时候不许可说假的。
     pub missing: Vec<String>,
+    /// 这个篮子能发出去的几条链接，按该递给对方的先后来排：本机名在前，IP 在后。
+    ///
+    /// 两条都给，因为发送方判不出对方在不在同一个广播域（ADR-0002）。空表示这台机器
+    /// 既没有本机名也没有可用的局域网地址——那时候链接算不出来。挂载命令不在这儿给，
+    /// 它在页面上，而且那份是按对方自己的系统给的。
+    pub links: Vec<String>,
 }
 
 /// 数据目录里读不进来的那个文件，以及为什么。它没有 id，所以别人的链接指不到它，
-/// 只在 `cherry list` / `show` 里露面。
+/// 只在 `cherry list` 里露面。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrokenView {
     pub name: String,
     pub file: String,
     pub error: String,
-}
-
-/// 一个篮子和它能发出去的几条链接。
-///
-/// 链接里没有篮子名（它就是一个凭证，见 ADR-0002），所以列好几个篮子的时候得把名字带上
-/// 才知道哪条是哪条。`links` 按该递给对方的先后来排：本机名在前，IP 在后。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LinkSet {
-    pub name: String,
-    /// 要改这个篮子就去改这个文件。
-    pub file: String,
-    /// 篮子里有几颗 cherry。列篮子的时候顺带让人看出它是不是空的。
-    pub items: usize,
-    pub links: Vec<String>,
 }
 
 // ---- 帧：长度前缀 + postcard ----
@@ -200,6 +186,7 @@ async fn dispatch_inner(svc: &Service, req: &Request) -> Result<Response> {
     match req {
         Request::Status => {
             let all = svc.baskets().await;
+            let cfg = svc.config_view().await;
             Ok(Response::Status {
                 baskets: all.ok.len(),
                 broken: all.broken.len(),
@@ -208,51 +195,47 @@ async fn dispatch_inner(svc: &Service, req: &Request) -> Result<Response> {
                 nfs_up: svc.nfs_up(),
                 http_port: cherry_core::link::http_port(),
                 http_up: svc.http_up(),
+                config_file: cfg.file,
+                owner: cfg.name,
+                config_error: cfg.error,
             })
         }
-        Request::ListBaskets => {
+        Request::List => {
             let all = svc.baskets().await;
             Ok(Response::Baskets {
                 dir: svc.data_dir().to_path_buf(),
-                ok: all.ok.iter().map(view).collect(),
-                broken: all.broken.iter().map(broken_view).collect(),
-            })
-        }
-        Request::ShowBasket { name } => Ok(Response::Basket(view(&svc.basket(name).await?))),
-        Request::Links => {
-            let all = svc.baskets().await;
-            let mut sets = Vec::with_capacity(all.ok.len());
-            for b in &all.ok {
-                sets.push(LinkSet {
-                    name: b.name.clone(),
-                    file: b.file.display().to_string(),
-                    items: b.cherries.len(),
-                    links: svc
-                        .links_of(b)?
-                        .into_iter()
-                        .map(|l| l.to_string())
-                        .collect(),
-                });
-            }
-            Ok(Response::Links {
-                dir: svc.data_dir().to_path_buf(),
-                sets,
+                // 链接算不出来的篮子照常打文件内容：一个篮子的问题不该让整个列表失败
+                // （ADR-0008 第五条那个道理）。空列表在 CLI 那边有一句话解释。
+                ok: all
+                    .ok
+                    .iter()
+                    .map(|b| {
+                        let links = svc
+                            .links_of(b)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|l| l.to_string())
+                            .collect();
+                        view(b, links)
+                    })
+                    .collect(),
                 broken: all.broken.iter().map(broken_view).collect(),
             })
         }
     }
 }
 
-/// 一个篮子交给用户看的样子：文件原文 + 哪几行现在读不到。
+/// 一个篮子交给用户看的样子：文件原文 + 哪几行现在读不到 + 能发出去的链接。
 ///
 /// 不再自己拼一份「篮子里有什么」——那是文件的事（ADR-0008）。要算的只有死活：
 /// 磁盘上的事文件里没有，而「有人看的时候不许可说假的」。
-fn view(b: &cherry_core::Basket) -> BasketView {
+fn view(b: &cherry_core::Basket, links: Vec<String>) -> BasketView {
     BasketView {
         name: b.name.clone(),
         id: hex::encode(b.id),
         file: b.file.display().to_string(),
         content: std::fs::read_to_string(&b.file).unwrap_or_default(),
+        links,
         missing: b
             .cherries
             .iter()
@@ -284,13 +267,11 @@ mod tests {
     #[tokio::test]
     async fn 帧往返() {
         let mut buf = Vec::new();
-        write_frame(&mut buf, &Request::ShowBasket { name: "b".into() })
-            .await
-            .unwrap();
+        write_frame(&mut buf, &Request::List).await.unwrap();
 
         let mut cur = std::io::Cursor::new(buf);
         let got: Request = read_frame(&mut cur).await.unwrap().unwrap();
-        assert!(matches!(got, Request::ShowBasket { .. }));
+        assert!(matches!(got, Request::List));
     }
 
     #[tokio::test]
