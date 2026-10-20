@@ -214,7 +214,7 @@ fi
 
 say ""
 say "接着可以："
-say "    cherry list                 本机有哪些篮子（每个带名字和 IP 两条链接）"
+say "    cherry list                 每个篮子一段：文件原文和可用地址的网页链接"
 say "    篮子就是 ~/.config/cherryshare/<名字>.basket，一行一条路径："
 say "    printf '%s\\n' ~/Pictures >>~/.config/cherryshare/我的照片.basket"
-say "    cherry list                  每个篮子两条链接：本机名一条、本机 IP 一条"
+say "    页面上「XX 分享给你的篮子」的 XX 默认是主机名；在 config.toml 里写 name 就换成你的"
