@@ -236,7 +236,7 @@ e2e:
     [ -z "$LEFT" ] || { echo "摘掉之后根目录里还剩东西 ✗: $LEFT" >&2; exit 1; }
     cherry show t | grep -q "源不在了" || { echo "show 没标出源不在了 ✗" >&2; exit 1; }
     grep -qx "$SRC" "$D/t.basket" || { echo "工具擅自改了你的篮子文件 ✗" >&2; exit 1; }
-    grep -q "源没了" "$D/log" || { echo "日志里没有那条 ✗" >&2; exit 1; }
+    grep -q "源的元数据读不到" "$D/log" || { echo "日志里没有那条 ✗" >&2; exit 1; }
 
     # 删篮子就是删文件：id 跟着没了，对方手里那条链接立刻打不开（这就是吊销）。
     rm "$D/t.basket"

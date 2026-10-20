@@ -149,15 +149,30 @@ pub fn resolve(basket: &Basket, path: &str) -> Result<(PathBuf, std::fs::Metadat
     //
     // 判法是「把解析后的真实路径的尾段，和请求的尾段逐段比」。只要中间跟过任何
     // 一个符号链接，两者就不一样，直接拒——这也正是「不共享符号链接」这条规则本身。
-    // 只 canonicalize 一次（cherry 的源在 `Basket::add` 里已经规范化过）。
+    //
+    // 比较得在同一基准上：源路径是手写的，中间可能带符号链接（macOS 上 `/tmp`、
+    // `/var` 就是这样），所以源也要规范化一次。源自己是个符号链接的先拒掉——列目录
+    // 那边本来也会跳过它。
     //
     // macOS 上 `realpath` 保留传入的大小写，所以同一段名字换大小写不会被误拒。
+    let root_meta = std::fs::symlink_metadata(&cherry.source)
+        .with_context(|| format!("读不到 {}", cherry.source.display()))?;
+    servable(&root_meta).with_context(|| {
+        format!(
+            "{} 不是普通文件也不是真目录，不共享",
+            cherry.source.display()
+        )
+    })?;
+    let source = cherry
+        .source
+        .canonicalize()
+        .with_context(|| format!("读不到 {}", cherry.source.display()))?;
     let real = full
         .canonicalize()
         .with_context(|| format!("读不到 {}", full.display()))?;
     let asked = full.strip_prefix(&cherry.source).unwrap_or(Path::new(""));
     let got = real
-        .strip_prefix(&cherry.source)
+        .strip_prefix(&source)
         .with_context(|| format!("`{path}` 指到了共享范围外面"))?;
     if got != asked {
         bail!("`{path}` 中间有符号链接，不共享");
@@ -321,6 +336,58 @@ mod tests {
         let top = list_dir(&b, "").unwrap();
         assert_eq!(top.len(), 1, "死引用该被跳过，不是让整层失败");
         assert_eq!(top[0].name, b.cherries[0].name);
+    }
+
+    /// 篮子文件里的路径是手写的，中间可能带符号链接（macOS 上 `/tmp`、`/var` 就是）。
+    /// 那不是穿过共享边界，不能因为源路径长这样就全读不到。
+    #[cfg(unix)]
+    #[test]
+    fn 源路径中间有符号链接也能读() {
+        let base = std::env::temp_dir().join(format!("cherry-viasym-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("real/sub")).unwrap();
+        std::fs::write(base.join("real/sub/a.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+
+        // 跟手写的一样：路径从那个链接进去，源本身还是真目录。
+        let b = Basket {
+            id: [0u8; 16],
+            name: "t".into(),
+            file: base.join("t.basket"),
+            cherries: vec![crate::basket::Cherry {
+                name: "sub".into(),
+                source: base.join("link/sub"),
+            }],
+        };
+        assert!(resolve(&b, "sub").is_ok(), "源路径中间有链接不该拦");
+        assert!(resolve(&b, "sub/a.txt").is_ok());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 源自己是个符号链接：不共享，子路径也不许绕过。
+    #[cfg(unix)]
+    #[test]
+    fn 源本身是符号链接就拒() {
+        let base = std::env::temp_dir().join(format!("cherry-selflink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("real")).unwrap();
+        std::fs::write(base.join("real/a.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+
+        let b = Basket {
+            id: [0u8; 16],
+            name: "t".into(),
+            file: base.join("t.basket"),
+            cherries: vec![crate::basket::Cherry {
+                name: "link".into(),
+                source: base.join("link"),
+            }],
+        };
+        assert!(resolve(&b, "link").is_err());
+        assert!(resolve(&b, "link/a.txt").is_err());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// 符号链接不共享，也不许从它中间穿过：指到外面等于绕开 `..` 的封锁，指到里面

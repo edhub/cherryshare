@@ -185,7 +185,7 @@ pub fn write_zip_roots(roots: &[(String, PathBuf)], out: &mut dyn Write) -> Resu
     let mut acc = Packed::default();
     for (name, path) in roots {
         let Some(meta) = meta_of(path) else {
-            // 引用没了（服务下次列目录时会摘掉它）。跳过，日志留一条。
+            // 引用没了。跳过，日志留一条；文件里那一行不动（ADR-0008）。
             tracing::warn!(cherry = %name, "源没了，打包跳过");
             acc.skipped += 1;
             continue;
