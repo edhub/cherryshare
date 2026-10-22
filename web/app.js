@@ -245,7 +245,7 @@ function sizeOf(entry, dir) {
   return got && got.stop === "done" ? got.bytes : Number.POSITIVE_INFINITY;
 }
 
-/** 能点的三列。第一次点给最想先看到的那个方向：名字从 A 头，大小从大到小，改过从新到旧。 */
+/** 能点的三列。第一次点给最想先看到的那个方向：名字从 A 头，大小从大到小，更新时间从新到旧。 */
 const SORT_COLS = {
   name: { 首点: 1, 比: byName },
   // 文件夹的大小看 sizeOf：量到的按量到的排，没量到的按最大算。比出来相等就保持原样
@@ -337,16 +337,28 @@ function fileRow(data, entry) {
 
   // 名字本身按类型给动作（视频图片在线看、文本按纯文本看）；下载不藏在名字里，
   // 它是右边那一列，位置固定——眼睛能学会「要拿就在最右边」。
+  //
+  // 能在线看的那几种，除了名字可点，右边还摆一个「预览」。只看名字是链接，很多人根本
+  // 不会去点，眼睛扫到「下载」就以为只能拿走。样式跟「下载」一样（`btn-ghost`）：整页
+  // 只有一个主按钮（复制挂载命令），其余都是幽灵按钮，多出来的那个点按不该比下载重。
+  // 预览在左、下载在右——下载始终待在最后一列。
   const kind = kindOf(entry.name);
-  const name = kind === "other"
-    ? `<span class="font-medium">${icon} ${esc(entry.name)}</span>`
-    : `<a class="link link-hover font-medium" href="${url}" data-open="1">${icon} ${esc(entry.name)}</a>`;
+  const previewable = kind !== "other";
+  const name = previewable
+    ? `<a class="link link-hover font-medium" href="${url}" data-open="1">${icon} ${esc(entry.name)}</a>`
+    : `<span class="font-medium">${icon} ${esc(entry.name)}</span>`;
+  const preview = previewable
+    ? `<a class="btn btn-ghost btn-xs" href="${url}" data-open="1" title="不下载，就在这儿看">预览</a>`
+    : "";
   return `<tr>
     <td>${name}</td>
     <td class="tabular-nums opacity-70 whitespace-nowrap">${size(entry.size)}</td>
     <td class="text-right opacity-60 whitespace-nowrap hidden sm:table-cell">${when(entry.mtime)}</td>
     <td class="text-right whitespace-nowrap">
-      <a class="btn btn-ghost btn-xs" href="${url}" download="${esc(entry.name)}" title="下载">下载</a>
+      <div class="inline-flex items-center justify-end gap-1">
+        ${preview}
+        <a class="btn btn-ghost btn-xs" href="${url}" download="${esc(entry.name)}" title="下载">下载</a>
+      </div>
     </td>
   </tr>`;
 }
@@ -383,7 +395,7 @@ function listCard(data) {
           <thead><tr>
             <th>${sortHead("name", "名字")}</th>
             <th>${sortHead("size", "大小")}</th>
-            <th class="text-right hidden sm:table-cell">${sortHead("mtime", "改过")}</th>
+            <th class="text-right hidden sm:table-cell">${sortHead("mtime", "更新时间")}</th>
             <th></th>
           </tr></thead>
           <tbody>${body || `<tr><td colspan="4" class="opacity-60">这里什么都没有。</td></tr>`}</tbody>
