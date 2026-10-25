@@ -19,7 +19,7 @@ use anyhow::{Context, Result, bail};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
-    basket::{self, Basket},
+    basket::{self, Basket, BasketId},
     config::Config,
     link::BasketLink,
 };
@@ -239,7 +239,7 @@ impl Service {
         )
     }
 
-    pub async fn basket_by_id(&self, id: &[u8; 16]) -> Result<Basket> {
+    pub async fn basket_by_id(&self, id: &BasketId) -> Result<Basket> {
         self.baskets()
             .await
             .ok
@@ -266,7 +266,7 @@ impl Service {
         }
         Ok(hosts
             .into_iter()
-            .map(|host| BasketLink::new(host, b.id))
+            .map(|host| BasketLink::new(host, b.id.clone()))
             .collect())
     }
 
@@ -280,7 +280,7 @@ impl Service {
             .into_iter()
             .next()
             .context("这台机器上既没有本机名，也没有可用的局域网地址")?;
-        Ok(BasketLink::new(host, b.id))
+        Ok(BasketLink::new(host, b.id.clone()))
     }
 
     /// 文件变了就重读。配置和篮子各自独立：谁变了就重读谁。
@@ -383,7 +383,7 @@ fn load_all(dir: &Path, previous: &[Basket]) -> State {
                 {
                     tracing::warn!(
                         basket = %b.name,
-                        old = %hex::encode(old.id), new = %hex::encode(b.id),
+                        old = %old.id, new = %b.id,
                         "这个篮子的 id 变了（文件里的 id 行被删掉了？），发给别人的旧链接不再有效"
                     );
                 }
@@ -474,7 +474,7 @@ fn migrate(dir: &Path) {
                     let mut body = String::from(
                         "# 从 baskets.json 迁过来的（ADR-0008）。这个文件就是篮子的全部定义。\n",
                     );
-                    body.push_str(&format!("id {}\n", hex::encode(b.id)));
+                    body.push_str(&format!("id {}\n", BasketId::from_bytes(b.id)));
                     for c in &b.cherries {
                         body.push_str(&format!("{}\n", c.source.display()));
                     }
@@ -635,7 +635,7 @@ mod tests {
 
         let svc = Service::start(dir.clone()).await.unwrap();
         let b = svc.basket("老篮子").await.unwrap();
-        assert_eq!(b.id, [7u8; 16]);
+        assert_eq!(b.id, BasketId::from_bytes([7u8; 16]));
         assert_eq!(b.cherries.len(), 1);
         assert!(dir.join("baskets.json.migrated").exists(), "原文件留档");
         assert!(!dir.join("baskets.json").exists());

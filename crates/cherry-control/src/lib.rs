@@ -232,7 +232,7 @@ async fn dispatch_inner(svc: &Service, req: &Request) -> Result<Response> {
 fn view(b: &cherry_core::Basket, links: Vec<String>) -> BasketView {
     BasketView {
         name: b.name.clone(),
-        id: hex::encode(b.id),
+        id: b.id.to_string(),
         file: b.file.display().to_string(),
         content: std::fs::read_to_string(&b.file).unwrap_or_default(),
         links,

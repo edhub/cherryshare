@@ -457,6 +457,7 @@ fn meta_of(path: &Path) -> Option<fs::Metadata> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cherry_core::BasketId;
     use std::io::Cursor;
 
     /// 每个测试拿自己的目录：并行跑时不能互相删。
@@ -580,7 +581,13 @@ mod tests {
     }
 
     fn basket(dir: &Path, cherries: Vec<cherry_core::Cherry>) -> Basket {
-        Basket::new([0u8; 16], "t".into(), dir.join("t.basket"), cherries).unwrap()
+        Basket::new(
+            BasketId::from_bytes([0u8; 16]),
+            "t".into(),
+            dir.join("t.basket"),
+            cherries,
+        )
+        .unwrap()
     }
 
     /// 打整个篮子：顶层条目并排，没有外套那层。

@@ -294,7 +294,7 @@ pub fn mtime_of(meta: &std::fs::Metadata) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::basket::Cherry;
+    use crate::basket::{BasketId, Cherry};
 
     /// 每个测试拿自己的目录：用 `process::id()` 的话几个测试会并行地互相删掉对方的目录。
     fn tree(tag: &str) -> (Basket, PathBuf) {
@@ -310,7 +310,7 @@ mod tests {
 
         let name = dir.file_name().unwrap().to_str().unwrap().to_owned();
         let b = Basket::new(
-            [0u8; 16],
+            BasketId::from_bytes([0u8; 16]),
             "t".into(),
             dir.join("t.basket"),
             vec![Cherry {
@@ -325,7 +325,13 @@ mod tests {
 
     /// 一串可见路径造一个篮子。`t.basket` 本身不存在，虚拟目录的 mtime 就是 0。
     fn basket(dir: &Path, cherries: Vec<Cherry>) -> Basket {
-        Basket::new([0u8; 16], "t".into(), dir.join("t.basket"), cherries).unwrap()
+        Basket::new(
+            BasketId::from_bytes([0u8; 16]),
+            "t".into(),
+            dir.join("t.basket"),
+            cherries,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -462,7 +468,7 @@ mod tests {
         let file = dir.with_extension("basket-mtime");
         std::fs::write(&file, "# t\n").unwrap();
         let b = Basket::new(
-            [0u8; 16],
+            BasketId::from_bytes([0u8; 16]),
             "t".into(),
             file.clone(),
             vec![Cherry {
@@ -610,7 +616,7 @@ mod tests {
         let base = std::fs::canonicalize(&base).unwrap();
 
         let b = Basket::new(
-            [0u8; 16],
+            BasketId::from_bytes([0u8; 16]),
             "t".into(),
             base.join("t.basket"),
             vec![Cherry {
@@ -637,7 +643,7 @@ mod tests {
         let base = std::fs::canonicalize(&base).unwrap();
 
         let b = Basket::new(
-            [0u8; 16],
+            BasketId::from_bytes([0u8; 16]),
             "t".into(),
             base.join("t.basket"),
             vec![Cherry {

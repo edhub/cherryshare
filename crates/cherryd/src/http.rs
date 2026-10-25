@@ -93,7 +93,7 @@ pub async fn serve(listener: tokio::net::TcpListener, svc: Service, web: PathBuf
 }
 
 async fn lookup(app: &App, id: &str) -> Option<Basket> {
-    let id = BasketLink::parse_basket_id_hex(id)?;
+    let id = BasketLink::parse_basket_id(id)?;
     app.svc.basket_by_id(&id).await.ok()
 }
 
@@ -177,7 +177,7 @@ async fn list_json(
 
     // 挂载命令里的主机默认用对方访问时用的那个；另一个（名字 ↔ IP）一并带上，供页面上切。
     let link = match request_host(headers) {
-        Some(h) => BasketLink::new(h, basket.id),
+        Some(h) => BasketLink::new(h, basket.id.clone()),
         None => match app.svc.link(&basket.name).await {
             Ok(l) => l,
             Err(e) => {
@@ -188,7 +188,8 @@ async fn list_json(
             }
         },
     };
-    let alt = cherry_core::link::alternate_host(&link.host).map(|h| BasketLink::new(h, basket.id));
+    let alt = cherry_core::link::alternate_host(&link.host)
+        .map(|h| BasketLink::new(h, basket.id.clone()));
     let mounts = [(MountOs::Macos, "macOS"), (MountOs::Linux, "Linux")]
         .into_iter()
         .map(|(os, label)| {
@@ -210,7 +211,7 @@ async fn list_json(
         name: basket.name.clone(),
         // 页面上「XX 分享给你的篮子」里的那个 XX。不是篮子名，是这台机器的主人。
         owner: app.svc.owner().await,
-        id: link.basket_id_hex(),
+        id: link.basket_id().to_owned(),
         link: link.to_string(),
         host: HostJson::from_host(&link.host),
         alt_host: alt.as_ref().map(|l| HostJson::from_host(&l.host)),

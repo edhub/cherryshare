@@ -20,6 +20,74 @@ use anyhow::{Context, Result, bail};
 /// 篮子文件的后缀。数据目录里其它的东西（编辑器备份、`.migrated`）一概不认。
 pub const SUFFIX: &str = ".basket";
 
+/// 篮子的 id：文件里 `id` 那一行、链接里那一段、NFS 挂载路径的第一段，都是它。
+///
+/// 默认是 128 bit 随机（[`BasketId::mint`]）；手写的也收，因为想记住一个篮子的凭证是
+/// 正当需求。代价落在写的人身上：它是**唯一的锁**（ADR-0002）——链接里除了主机地址
+/// 就只有它。
+///
+/// 字符集卡在 `[A-Za-z0-9._-]`：这段东西会进网页 URL 的路径、进对方要粘的那行 shell
+/// 命令、也进 NFS 的导出路径。空白、斜杠、冒号、引号、`%` 都会把其中一处搞坏。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BasketId(String);
+
+impl BasketId {
+    /// 手写 id 的长度上限。够长了，而且让报错的话说得清楚。
+    pub const MAX_LEN: usize = 128;
+
+    /// 校验一个手写的 id。
+    pub fn parse(s: &str) -> Result<Self> {
+        if s.is_empty() {
+            bail!("id 后面得跟点什么");
+        }
+        if s.len() > Self::MAX_LEN {
+            bail!("id 太长（最多 {} 个字符）", Self::MAX_LEN);
+        }
+        if !s
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        {
+            bail!("`{s}` 里有当不了 id 的字符（只给字母数字和 `-` `_` `.` 留位置）");
+        }
+        Ok(Self(s.to_owned()))
+    }
+
+    /// 128 bit 随机，32 位十六进制。文件里没有 `id` 行时发这个。
+    pub fn mint() -> Result<Self> {
+        let mut bytes = [0u8; 16];
+        getrandom::getrandom(&mut bytes).map_err(|e| anyhow::anyhow!("取随机数失败: {e}"))?;
+        Ok(Self::from_bytes(bytes))
+    }
+
+    /// 16 个字节写成 32 位十六进制。迁移老数据用。
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(hex::encode(bytes))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// 挂载点里那一段：id 的前 8 个字符，短了就全给。
+    ///
+    /// 字符集是 ASCII，所以按字节切不会切坏。
+    pub fn short(&self) -> &str {
+        &self.0[..self.0.len().min(8)]
+    }
+}
+
+impl std::fmt::Display for BasketId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for BasketId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 /// 篮子里的东西。放进来的是引用，源文件不动。
 #[derive(Debug, Clone)]
 pub struct Cherry {
@@ -44,8 +112,8 @@ pub struct Node {
 
 #[derive(Debug, Clone)]
 pub struct Basket {
-    /// 128 bit 随机（ADR-0002）。需要的是不可猜测性，不是唯一性。
-    pub id: [u8; 16],
+    /// 访问凭证（ADR-0002）。文件里手写，没写才自动发一个。
+    pub id: BasketId,
     /// 文件名去掉 `.basket`。改了文件名就是改了篮子名，id 不变。
     pub name: String,
     /// 定义这个篮子的文件（`<数据目录>/<名字>.basket`）。
@@ -59,13 +127,13 @@ pub struct Basket {
 
 impl Basket {
     /// 用一组 cherry 造一个篮子。主要给测试和迁移用；正常读文件走 [`load`]。
-    pub fn new(id: [u8; 16], name: String, file: PathBuf, cherries: Vec<Cherry>) -> Result<Self> {
+    pub fn new(id: BasketId, name: String, file: PathBuf, cherries: Vec<Cherry>) -> Result<Self> {
         let tree = build_tree(&cherries)?;
         Ok(Self::with_tree(id, name, file, cherries, tree))
     }
 
     fn with_tree(
-        id: [u8; 16],
+        id: BasketId,
         name: String,
         file: PathBuf,
         cherries: Vec<Cherry>,
@@ -134,7 +202,7 @@ pub fn load(path: &Path) -> Result<Basket> {
     let id = match parsed.id {
         Some(id) => id,
         None => {
-            let id = mint_id()?;
+            let id = BasketId::mint()?;
             write_id(path, &id)
                 .with_context(|| format!("文件里没有 id，也写不回去 {}", path.display()))?;
             tracing::info!(basket = %name, file = %path.display(), "文件里没有 id，发了一个并写回去");
@@ -153,14 +221,14 @@ pub fn load(path: &Path) -> Result<Basket> {
 
 #[derive(Debug)]
 struct Parsed {
-    id: Option<[u8; 16]>,
+    id: Option<BasketId>,
     cherries: Vec<Cherry>,
     tree: Node,
 }
 
 /// 解析文件内容。行号从 1 数，出错时报给人看的就是这个号。
 ///
-/// 规矩只有四条：`#` 开头和空行忽略；`id <32 位十六进制>` 是凭证（最多一行）；其余每行
+/// 规矩只有四条：`#` 开头和空行忽略；`id <凭证>` 是凭证（最多一行）；其余每行
 /// 是一条路径（`~/` 开头或绝对路径）；路径里第一个 `.` 段把「源」和「可见路径」分开。
 fn parse(text: &str) -> Result<Parsed> {
     let mut id = None;
@@ -177,14 +245,11 @@ fn parse(text: &str) -> Result<Parsed> {
             None => (line, ""),
         };
         if head == "id" {
-            let bytes = hex::decode(tail)
-                .ok()
-                .filter(|b| b.len() == 16)
-                .with_context(|| format!("第 {n} 行：id 后面得是 32 位十六进制"))?;
+            let parsed = BasketId::parse(tail).with_context(|| format!("第 {n} 行"))?;
             if id.is_some() {
                 bail!("第 {n} 行：id 只能有一行");
             }
-            id = Some(bytes.try_into().expect("上面查过长度"));
+            id = Some(parsed);
             continue;
         }
 
@@ -330,17 +395,11 @@ fn expand(raw: &str, n: usize) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn mint_id() -> Result<[u8; 16]> {
-    let mut id = [0u8; 16];
-    getrandom::getrandom(&mut id).map_err(|e| anyhow::anyhow!("取随机数失败: {e}"))?;
-    Ok(id)
-}
-
 /// 把 `id` 那一行插进文件，返回插过的内容（测试用）。
 ///
 /// 插在开头那段注释和空行**之后**：手写的说明留在文件头上，`id` 紧贴着真正的配置。
 /// 写临时文件再 rename：写到一半断电不会给你留下半个篮子。
-fn write_id(path: &Path, id: &[u8; 16]) -> Result<()> {
+fn write_id(path: &Path, id: &BasketId) -> Result<()> {
     let text = std::fs::read_to_string(path)?;
     let out = with_id(&text, id);
 
@@ -354,8 +413,8 @@ fn write_id(path: &Path, id: &[u8; 16]) -> Result<()> {
     Ok(())
 }
 
-fn with_id(text: &str, id: &[u8; 16]) -> String {
-    let line = format!("id {}\n", hex::encode(id));
+fn with_id(text: &str, id: &BasketId) -> String {
+    let line = format!("id {id}\n");
     let mut at = text.len();
     let mut offset = 0;
     for raw in text.split_inclusive('\n') {
@@ -407,7 +466,7 @@ id 3f2ae0c1d9b84f5a8c1d2e3f4a5b6c7d
 /tmp
 ";
         let p = parse(text).unwrap();
-        assert_eq!(p.id.unwrap()[0], 0x3f);
+        assert_eq!(p.id.unwrap().as_str(), "3f2ae0c1d9b84f5a8c1d2e3f4a5b6c7d");
         assert_eq!(p.cherries.len(), 2);
         assert_eq!(p.cherries[0].path, "Pictures");
         assert_eq!(p.cherries[0].source, home().join("Pictures"));
@@ -504,9 +563,17 @@ id 3f2ae0c1d9b84f5a8c1d2e3f4a5b6c7d
         assert!(agent.children["y"].children["z"].source.is_some());
     }
 
+    /// 手写的 id 原样就是凭证，不用是十六进制。
+    #[test]
+    fn 手写一个简单_id_也认() {
+        let p = parse("id photos\n/a\n").unwrap();
+        assert_eq!(p.id.unwrap().as_str(), "photos");
+    }
+
     #[test]
     fn id_写坏了两处都要报() {
-        assert!(parse("id zz\n").is_err());
+        assert!(parse("id\n").is_err(), "后面什么都没有");
+        assert!(parse("id a/b\n").is_err(), "斜杠进不了 id");
         assert!(parse("id 0011223344556677\nid 8899aabbccddeeff\n").is_err());
     }
 
@@ -535,7 +602,8 @@ id 3f2ae0c1d9b84f5a8c1d2e3f4a5b6c7d
         let text = std::fs::read_to_string(&file).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], "# 说明", "手写的说明还在最上面");
-        assert_eq!(lines[1], format!("id {}", hex::encode(b.id)));
+        assert_eq!(lines[1], format!("id {}", b.id));
+        assert_eq!(b.id.as_str().len(), 32, "发出来的还是 32 位十六进制");
         assert_eq!(lines[2], "~/Pictures");
 
         // 再读一次得是同一个 id（已经落在文件里了）。
@@ -546,16 +614,10 @@ id 3f2ae0c1d9b84f5a8c1d2e3f4a5b6c7d
     /// 整份文件只有注释、并且最后没有换行：新行不能粘到注释行后面去。
     #[test]
     fn 全是注释的文件也插得进去() {
-        let id = [7u8; 16];
-        assert_eq!(
-            with_id("# 只有一行", &id),
-            format!("# 只有一行\nid {}\n", hex::encode(id))
-        );
-        assert_eq!(with_id("", &id), format!("id {}\n", hex::encode(id)));
-        assert_eq!(
-            with_id("~/a\n", &id),
-            format!("id {}\n~/a\n", hex::encode(id))
-        );
+        let id = BasketId::from_bytes([7u8; 16]);
+        assert_eq!(with_id("# 只有一行", &id), format!("# 只有一行\nid {id}\n"));
+        assert_eq!(with_id("", &id), format!("id {id}\n"));
+        assert_eq!(with_id("~/a\n", &id), format!("id {id}\n~/a\n"));
     }
 
     #[test]

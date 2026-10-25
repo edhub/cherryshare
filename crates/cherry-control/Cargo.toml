@@ -12,4 +12,3 @@ serde.workspace = true
 postcard.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-hex.workspace = true

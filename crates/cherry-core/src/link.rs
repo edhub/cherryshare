@@ -6,6 +6,8 @@ use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
 
+use crate::basket::BasketId;
+
 /// 局域网那条路（NFS 导出）用的固定端口。
 ///
 /// 固定是为了不把它塞进链接里：链接的格式就不用动了。代价是端口被占就起不来，
@@ -29,15 +31,16 @@ pub fn http_port() -> u16 {
 
 /// 分享的单位就是一个 link。
 ///
-/// 文本形态是 `cherryshare:<地址>:<32 位十六进制>`。自己发明这个格式（不再借
+/// 文本形态是 `cherryshare:<地址>:<id>`。自己发明这个格式（不再借
 /// `iroh-tickets`）是因为它只有十几行，而**可读性在这里是功能**：这条链接会被人
 /// 粘进聊天窗口，也可能被人看一眼。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BasketLink {
     /// 对方怎么找到创建者。见 [`Host`]。
     pub host: Host,
-    /// 凭证，不是索引：谁拿到谁就能看。吊销 = 换一个新的 `basket_id`。
-    pub basket_id: [u8; 16],
+    /// 凭证，不是索引：谁拿到谁就能看。吊销 = 换一个新的 `basket_id`
+    /// （删掉文件里 `id` 那行再让它重发也行）。
+    pub basket_id: BasketId,
 }
 
 /// 链接和挂载命令里那一段地址：一个 IP，或者对方能解析的一个名字。
@@ -168,18 +171,18 @@ pub enum MountOs {
 }
 
 impl BasketLink {
-    pub fn new(host: Host, basket_id: [u8; 16]) -> Self {
+    pub fn new(host: Host, basket_id: BasketId) -> Self {
         Self { host, basket_id }
     }
 
-    /// 挂载路径里那一段。它是唯一的权威，`cherryd` 那边解析它。
-    pub fn basket_id_hex(&self) -> String {
-        hex::encode(self.basket_id)
+    /// 挂载路径、网页 URL 里那一段。它是唯一的权威，`cherryd` 那边解析它。
+    pub fn basket_id(&self) -> &str {
+        self.basket_id.as_str()
     }
 
-    /// [`Self::basket_id_hex`] 的反函数。
-    pub fn parse_basket_id_hex(s: &str) -> Option<[u8; 16]> {
-        hex::decode(s).ok()?.try_into().ok()
+    /// [`Self::basket_id`] 的反函数：从 URL 或挂载路径里那段字符串认回一个 id。
+    pub fn parse_basket_id(s: &str) -> Option<BasketId> {
+        BasketId::parse(s).ok()
     }
 
     /// 挂载点的最后一段：`<名字>-<id 前 8 位>`。两个系统各自拼自己的父目录
@@ -195,7 +198,7 @@ impl BasketLink {
     /// 注意 **Finder 里显示的不是这个名字**：那用的是卷名，NFS 取的是导出路径的最后一段
     /// （也就是完整 id），改不了。
     pub fn mountpoint_leaf(&self, basket_name: &str) -> String {
-        let short = &self.basket_id_hex()[..8];
+        let short = self.basket_id.short();
         if basket_name.is_empty() {
             short.to_owned()
         } else {
@@ -205,7 +208,7 @@ impl BasketLink {
 
     /// 挂载命令里的 `server:/path`。
     pub fn mount_source(&self) -> String {
-        format!("{}:/{}", self.host, self.basket_id_hex())
+        format!("{}:/{}", self.host, self.basket_id)
     }
 
     /// macOS 的挂载点。两个系统各自拼自己的父目录，但“叫什么”只此一处。
@@ -222,12 +225,7 @@ impl BasketLink {
     ///
     /// 端口得写出来（HTTP_PORT 不是 80）。凭证就是路径里那一段 id。
     pub fn web_url(&self) -> String {
-        format!(
-            "http://{}:{}/b/{}/",
-            self.host,
-            http_port(),
-            self.basket_id_hex()
-        )
+        format!("http://{}:{}/b/{}/", self.host, http_port(), self.basket_id)
     }
 
     /// 对方要粘的那一行命令（`mkdir` 和挂载串在一起，粘一次就行）。
@@ -380,7 +378,7 @@ fn route_source_addr() -> Option<IpAddr> {
 
 impl fmt::Display for BasketLink {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "cherryshare:{}:{}", self.host, self.basket_id_hex())
+        write!(f, "cherryshare:{}:{}", self.host, self.basket_id)
     }
 }
 
@@ -393,12 +391,11 @@ impl FromStr for BasketLink {
             .strip_prefix("cherryshare:")
             .context("链接要以 `cherryshare:` 开头")?;
         // 从右边切最后一个 ':'，这样带冒号的 IPv6 也不会切错。
-        let (host, id_hex) = rest
+        let (host, id) = rest
             .rsplit_once(':')
             .context("链接里没有地址和 id 的分隔")?;
         let host = Host::parse(host).context("链接里那段地址用不了")?;
-        let basket_id =
-            Self::parse_basket_id_hex(id_hex).context("链接里的 basket id 不是 32 位十六进制")?;
+        let basket_id = BasketId::parse(id).context("链接里的 basket id 用不了")?;
         Ok(Self { host, basket_id })
     }
 }
@@ -408,7 +405,10 @@ mod tests {
     use super::*;
 
     fn sample() -> BasketLink {
-        BasketLink::new(Host::parse("192.168.8.195").unwrap(), [7u8; 16])
+        BasketLink::new(
+            Host::parse("192.168.8.195").unwrap(),
+            BasketId::from_bytes([7u8; 16]),
+        )
     }
 
     #[test]
@@ -421,7 +421,10 @@ mod tests {
 
     #[test]
     fn ipv6_要套方括号且能解析回来() {
-        let link = BasketLink::new(Host::parse("fd00::1").unwrap(), [1u8; 16]);
+        let link = BasketLink::new(
+            Host::parse("fd00::1").unwrap(),
+            BasketId::from_bytes([1u8; 16]),
+        );
         let s = link.to_string();
         assert!(s.contains("[fd00::1]"), "{s}");
         assert_eq!(s.parse::<BasketLink>().unwrap(), link);
@@ -437,13 +440,16 @@ mod tests {
         // 名字是允许的，所以坏的是那串字符本身。
         let e = "cherryshare:a b:07".parse::<BasketLink>().unwrap_err();
         assert!(format!("{e:#}").contains("主机名"), "{e:#}");
-        let e = "cherryshare:1.2.3.4:zz".parse::<BasketLink>().unwrap_err();
-        assert!(e.to_string().contains("32 位十六进制"), "{e}");
+        let e = "cherryshare:1.2.3.4:a/b".parse::<BasketLink>().unwrap_err();
+        assert!(format!("{e:#}").contains("id"), "{e:#}");
     }
 
     #[test]
     fn 名字也能进链接() {
-        let link = BasketLink::new(Host::parse("mbpmax.local").unwrap(), [3u8; 16]);
+        let link = BasketLink::new(
+            Host::parse("mbpmax.local").unwrap(),
+            BasketId::from_bytes([3u8; 16]),
+        );
         let s = link.to_string();
         assert_eq!(s, format!("cherryshare:mbpmax.local:{}", "03".repeat(16)));
         assert_eq!(s.parse::<BasketLink>().unwrap(), link);
@@ -523,7 +529,7 @@ mod tests {
         assert_eq!(link.mountpoint_leaf("我的照片"), "我的照片-07070707");
         assert_eq!(link.mountpoint_leaf(""), "07070707", "没名字就只剩 id");
         // 两个同名篮子靠短 id 分开。
-        let other = BasketLink::new(sample().host, [8u8; 16]);
+        let other = BasketLink::new(sample().host, BasketId::from_bytes([8u8; 16]));
         assert_ne!(link.mountpoint_leaf("照片"), other.mountpoint_leaf("照片"));
     }
 
@@ -543,7 +549,7 @@ mod tests {
             assert_eq!(leaf, format!("{want}-07070707"), "{raw}");
         }
         // 投影之后撞了名字也没事：后面那 8 位不一样。
-        let other = BasketLink::new(sample().host, [8u8; 16]);
+        let other = BasketLink::new(sample().host, BasketId::from_bytes([8u8; 16]));
         assert_ne!(
             link.mountpoint_leaf("a b"),
             other.mountpoint_leaf("a-b"),
@@ -557,7 +563,7 @@ mod tests {
         for os in [MountOs::Macos, MountOs::Linux] {
             let cmd = link.mount_command(os, "~/cherry/x");
             assert!(cmd.contains("192.168.8.195:/"), "{cmd}");
-            assert!(cmd.contains(&link.basket_id_hex()), "{cmd}");
+            assert!(cmd.contains(link.basket_id()), "{cmd}");
             assert!(cmd.contains(&format!("port={NFS_PORT}")), "{cmd}");
         }
     }
@@ -585,24 +591,21 @@ mod tests {
         );
     }
 
+    /// 手写的 id 原样进链接、原样认回来；收发两边不查长度，也不规范大小写。
     #[test]
-    fn 篮子_id_的十六进制能来回() {
-        let id = [
-            0x7f, 0xcb, 0xce, 0xab, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
-        ];
-        let link = BasketLink::new(sample().host, id);
-        assert_eq!(link.basket_id_hex().len(), 32);
+    fn 手写的_id_原样进出链接() {
+        let link = BasketLink::new(sample().host, BasketId::parse("photos").unwrap());
+        assert_eq!(link.mount_source(), "192.168.8.195:/photos");
+        let s = link.to_string();
+        assert_eq!(s, "cherryshare:192.168.8.195:photos");
+        assert_eq!(s.parse::<BasketLink>().unwrap(), link);
         assert_eq!(
-            BasketLink::parse_basket_id_hex(&link.basket_id_hex()),
-            Some(id)
+            BasketLink::parse_basket_id("Photos").unwrap().as_str(),
+            "Photos"
         );
-        assert_eq!(BasketLink::parse_basket_id_hex("7fcbceab"), None, "短了");
-        assert_eq!(
-            BasketLink::parse_basket_id_hex(&"z".repeat(32)),
-            None,
-            "不是十六进制"
-        );
-        assert_eq!(BasketLink::parse_basket_id_hex(""), None);
+        for bad in ["", "a/b", "a:b", "a b"] {
+            assert_eq!(BasketLink::parse_basket_id(bad), None, "该拒：{bad:?}");
+        }
     }
 
     #[test]

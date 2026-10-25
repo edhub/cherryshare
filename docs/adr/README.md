@@ -19,7 +19,7 @@
 
 - **basket** —— 用户创建的分享单位，就是数据目录里的一个 `<名字>.basket` 文件（ADR-0008）。创建者是其中所有内容的唯一源。它是一篮 cherry，不是目录：文件留在原处，basket 里只记录引用。
 - **cherry** —— basket 文件里的一行：`可见路径 + 源路径`。没有 `/./` 时可见路径就是最后一段；带 `/./` 时保留后面的目录层级（ADR-0009）。可见路径在 basket 内唯一，且不能一条是另一条的前缀。
-- **BasketLink** —— `{ host: Host, basket_id: [u8; 16] }`，host 可以是 IP 或主机名。内部文本形态是 `cherryshare:<host>:<32 位十六进制>`；`cherry list` 给用户的是 `http://<host>:20480/b/<id>/`。两者使用同一个凭证（ADR-0002）。
+- **BasketLink** —— `{ host: Host, basket_id: BasketId }`，host 可以是 IP 或主机名，id 是文件里手写的凭证（不写就发一个 32 位十六进制的随机值）。内部文本形态是 `cherryshare:<host>:<id>`；`cherry list` 给用户的是 `http://<host>:20480/b/<id>/`。两者使用同一个凭证（ADR-0002）。
 - **目录（listing）** —— **一个目录**的内容清单：`(名字, 种类, size, mtime, mode)`。由创建者现算，不递归。NFS 和网页列表共用这套逻辑（ADR-0002）。
 - **服务** —— 读 `.basket` 文件、热加载并把它们讲成 NFS / HTTP 的常驻进程，同时提供 local socket、NFS（20490）和 HTTP（默认 20480）。可以由系统拉起，也可以前台运行。
 - **管理客户端** —— 现在只有 CLI，通过 local socket 读服务（写是直接改文件）。接收者用浏览器看和下载，或用系统 NFS 客户端挂载；都不用安装 CherryShare。`config.toml` 里只放「这台机器怎么对外表现」，目前只有一项 `name`（ADR-0010）。
