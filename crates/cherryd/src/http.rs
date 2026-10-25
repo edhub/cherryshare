@@ -24,6 +24,9 @@
 //! NFS 那条路不受影响。
 //!
 //! 失败的三种说法分开：篮子不在、文件不在、网页文件没装。不许静默 404（ADR-0001）。
+//! 连路由都认不出来的路径也一样给一段话：**空 body 的 4xx 在浏览器里会变成一个网络错误**
+//! （Chrome 的 `ERR_HTTP_RESPONSE_CODE_FAILURE`），人只看到「网页无法打开」，看不出是
+//! 少了结尾的斜杠还是链接过期。
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,9 +35,9 @@ use anyhow::{Context, Result, bail};
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{OriginalUri, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -81,7 +84,9 @@ pub async fn serve(listener: tokio::net::TcpListener, svc: Service, web: PathBuf
     }
     let app = Router::new()
         .route("/b/{id}/", get(page))
+        .route("/b/{id}", get(fill_slash))
         .route("/b/{id}/{*rest}", get(any))
+        .fallback(fallback)
         .with_state(App {
             svc,
             web: Arc::new(web),
@@ -90,6 +95,25 @@ pub async fn serve(listener: tokio::net::TcpListener, svc: Service, web: PathBuf
         });
     axum::serve(listener, app).await.context("HTTP 服务退出")?;
     Ok(())
+}
+
+/// `/b/<id>`：只是少了结尾那个斜杠。补上，别让浏览器把 `?path=` 丢掉。
+///
+/// 手敲、从聊天窗口复制、被别的东西去掉尾巴，都会落到这儿。
+async fn fill_slash(OriginalUri(uri): OriginalUri) -> Redirect {
+    let query = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+    Redirect::permanent(&format!("{}/{query}", uri.path()))
+}
+
+/// 路由认不出来的路径。回一段能读懂的话，不回空 4xx。
+async fn fallback(OriginalUri(uri): OriginalUri) -> Response {
+    plain(
+        StatusCode::NOT_FOUND,
+        &format!(
+            "这里没有 `{}`。网页入口是 `/b/<篮子id>/`，用 `cherry list` 给出的链接就行。",
+            uri.path()
+        ),
+    )
 }
 
 async fn lookup(app: &App, id: &str) -> Option<Basket> {
